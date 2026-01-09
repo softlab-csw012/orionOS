@@ -1,0 +1,7 @@
+
+# OS images / disk images
+*.img
+*.iso
+*.vmdk
+*.qcow2
+
