@@ -45,9 +45,6 @@ init/init.bin: init/init.asm
 test.bin: test/test.asm
 	nasm -f bin test/test.asm -o test.bin
 
-test2.bin: test/test2.asm
-	nasm -f bin test/test2.asm -o test2.bin
-
 syscall_io.bin: test/syscall_io.asm
 	nasm -f bin test/syscall_io.asm -o syscall_io.bin
 	
@@ -83,14 +80,13 @@ test/ramdisk.img: FORCE
 		mcopy -i $@ orion.stg ::/system/config/orion.stg; \
 		mcopy -i $@ test/motd.txt ::/system/config/motd.txt; \
 		mcopy -i $@ test.bin ::/home/test.bin; \
-		mcopy -i $@ test2.bin ::/home/test2.bin; \
 		mcopy -i $@ syscall_io.bin ::/home/syscall_io.bin; \
 	fi;
 
 #────────────────────────────────────
 # Limine용 IMG 이미지 생성 (MBR + FAT32 + /boot/orion.ker)
 #────────────────────────────────────
-orion.img: init/init.bin kernel.elf test.bin test2.bin syscall_io.bin test/orion.psfu test/123.wav test/1.wav test/ramdisk.img $(LIMINE_CONF) $(LIMINE_BIOS_SYS) $(LIMINE_BIOS_HDD) | $(LIMINE_BIN)
+orion.img: init/init.bin kernel.elf test.bin syscall_io.bin test/orion.psfu test/123.wav test/1.wav test/ramdisk.img $(LIMINE_CONF) $(LIMINE_BIOS_SYS) $(LIMINE_BIOS_HDD) | $(LIMINE_BIN)
 	@echo "[+] Creating 512MB disk image..."
 	dd if=/dev/zero of=$@ bs=1M count=512 status=none
 
@@ -122,7 +118,6 @@ orion.img: init/init.bin kernel.elf test.bin test2.bin syscall_io.bin test/orion
 	sudo cp orion.stg mnt/system/config/orion.stg; \
 	sudo cp test/motd.txt mnt/system/config/motd.txt; \
 	sudo cp test.bin mnt/home/test.bin; \
-	sudo cp test2.bin mnt/home/test2.bin; \
 	sudo cp test/app.bin mnt/home/app.bin; \
 	sudo cp syscall_io.bin mnt/home/syscall_io.bin; \
 	\
@@ -137,7 +132,7 @@ orion.img: init/init.bin kernel.elf test.bin test2.bin syscall_io.bin test/orion
 # QEMU 실행
 #────────────────────────────────────
 run: orion.img
-	qemu-system-i386 -m 1G \
+	qemu-system-x86_64 -m 1G \
 		-drive format=raw,file=orion.img -boot c \
 		-drive format=raw,file=test/disk.img,if=ide,index=1,media=disk \
 		-drive format=raw,file=test/xvfs.img,if=ide,index=2,media=disk \

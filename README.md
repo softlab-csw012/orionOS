@@ -1,6 +1,6 @@
 # orionOS
 
-Created by softlab-kor.
+Created by Softlab-KOR.
 This is the original source code.
 
 orionOS is a hybrid-licensed project.
@@ -49,7 +49,7 @@ make run
 ```
 
 ## License
-Open Practical License (OPL) Version 1.0 (Non-OSI). See `LICENSE`.
+Open Practical License (OPL) Version 1.1 and BSD 3-Clause License. See `LICENSE`.
 
 Copyright (c) 2025 softlab-kor
 
