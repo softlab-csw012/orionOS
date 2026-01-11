@@ -51,7 +51,7 @@ make run
 ## License
 Open Practical License (OPL) Version 1.1 and BSD 3-Clause License. See `LICENSE`.
 
-Copyright (c) 2025 softlab-kor
+Copyright (c) 2025 Softlab-KOR
 
 NOTICE:
 This license is not approved by the Open Source Initiative (OSI). It is
