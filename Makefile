@@ -11,10 +11,9 @@ OBJ = ${C_SOURCES:.c=.o} $(ASM_OBJ)
 #────────────────────────────────────
 # 부트로더 (Limine)
 #────────────────────────────────────
-LIMINE_DIR = limine
-LIMINE_BIN = $(LIMINE_DIR)/limine
+LIMINE_BIN = boot/limine
 LIMINE_CONF = limine.conf
-LIMINE_BIOS_SYS = $(LIMINE_DIR)/limine-bios.sys
+LIMINE_BIOS_SYS = boot/limine-bios.sys
 # dd if=orion.img of=mbr.bin bs=446 count=1
 
 #────────────────────────────────────
