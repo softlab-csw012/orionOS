@@ -1,4 +1,5 @@
 #include "bin.h"
+#include "elf.h"
 #include "kernel.h"
 #include "proc/proc.h"
 #include "bootcmd.h"
@@ -43,29 +44,31 @@ bool load_bin(const char* path, uint32_t* phys_entry, uint32_t* out_size) {
     uint8_t* dest = (uint8_t*)BIN_LOAD_ADDR;
     memset(dest, 0, BIN_MAX_SIZE);
 
-    uint32_t offset = 0;
-
-    while (1) {
-        uint8_t buf[512];
-        int n = fscmd_read_file_partial(path, offset, buf, sizeof(buf));
-        if (n <= 0) break;
-
-        memcpy(dest + offset, buf, n);
-        offset += n;
-
-        if (offset >= BIN_MAX_SIZE) {
-            kprintf("BIN too large!\n");
-            return false;
-        }
-    }
-
-    if (offset == 0) {
+    uint32_t size = fscmd_get_file_size(path);
+    if (size == 0) {
         kprintf("BIN load failed: empty file\n");
         return false;
     }
+    if (size > BIN_MAX_SIZE) {
+        kprintf("BIN too large! (%u bytes)\n", size);
+        return false;
+    }
+
+    uint32_t offset = 0;
+    while (offset < size) {
+        uint32_t to_read = size - offset;
+        if (to_read > 512u) {
+            to_read = 512u;
+        }
+        if (!fscmd_read_file_partial(path, offset, dest + offset, to_read)) {
+            kprintf("BIN load failed at %u\n", offset);
+            return false;
+        }
+        offset += to_read;
+    }
 
     *phys_entry = BIN_LOAD_ADDR;
-    *out_size   = offset;
+    *out_size   = size;
     return true;
 }
 
@@ -109,49 +112,69 @@ __attribute__((naked)) void bin_exit_trampoline(void) {
 // 5) init.sys 실행
 // ======================================================
 bool start_init(void) {
-    uint32_t phys_entry = 0;
-    uint32_t bin_size   = 0;
+    uint32_t entry = 0;
+    uint32_t image_base = 0;
+    uint32_t image_size = 0;
+    bool is_elf = false;
 
     kprint("[init.sys] Loading init.sys...\n");
 
-    if (!load_bin("/system/core/init.sys", &phys_entry, &bin_size)) {
-        kprint("[init.sys] Failed to load.\n");
+    if (elf_load_image("/system/core/init.sys", &entry, &image_base, &image_size, &is_elf)) {
+        kprintf("[init.sys] Loaded ELF entry %x\n", entry);
+    } else if (is_elf) {
+        kprint("[init.sys] Failed to load ELF.\n");
         kprint("[");
         kprint_color("ERROR", 4, 0);
-        kprint("] kernel panic: init.sys missing!\n");
+        kprint("] kernel panic: init.sys load failed!\n");
         return false;
-    }
+    } else {
+        uint32_t phys_entry = 0;
+        uint32_t bin_size   = 0;
+        if (!load_bin("/system/core/init.sys", &phys_entry, &bin_size)) {
+            kprint("[init.sys] Failed to load.\n");
+            kprint("[");
+            kprint_color("ERROR", 4, 0);
+            kprint("] kernel panic: init.sys missing!\n");
+            return false;
+        }
 
-    uint32_t alloc_size = (bin_size + 0xFFFu) & ~0xFFFu;
-    void* virt_entry = kmalloc(alloc_size, 1, NULL);
-    if (!virt_entry) {
-        kprint("[init.sys] kmalloc failed\n");
-        return false;
-    }
+        uint32_t alloc_size = (bin_size + 0xFFFu) & ~0xFFFu;
+        void* virt_entry = kmalloc(alloc_size, 1, NULL);
+        if (!virt_entry) {
+            kprint("[init.sys] kmalloc failed\n");
+            return false;
+        }
 
-    memset(virt_entry, 0, alloc_size);
-    memcpy(virt_entry, (void*)phys_entry, bin_size);
+        memset(virt_entry, 0, alloc_size);
+        memcpy(virt_entry, (void*)phys_entry, bin_size);
 
-    kprintf("[init.sys] Copied init.sys to virt %x (size %u)\n",
-            (uint32_t)virt_entry, bin_size);
+        kprintf("[init.sys] Copied init.sys to virt %x (size %u)\n",
+                (uint32_t)virt_entry, bin_size);
 
-    if (vmm_mark_user_range(BIN_LOAD_ADDR, BIN_MAX_SIZE) != 0 ||
-        vmm_mark_user_range((uint32_t)virt_entry, alloc_size) != 0) {
-        kprint("[init.sys] Failed to mark user pages\n");
-        kfree(virt_entry);
-        return false;
+        if (vmm_mark_user_range(BIN_LOAD_ADDR, BIN_MAX_SIZE) != 0 ||
+            vmm_mark_user_range((uint32_t)virt_entry, alloc_size) != 0) {
+            kprint("[init.sys] Failed to mark user pages\n");
+            kfree(virt_entry);
+            return false;
+        }
+
+        entry = (uint32_t)virt_entry;
+        image_base = (uint32_t)virt_entry;
+        image_size = alloc_size;
     }
 
     process_t* init_proc =
-        proc_create("/system/core/init.sys", (uint32_t)virt_entry);
+        proc_create("/system/core/init.sys", entry);
 
     if (!init_proc) {
         kprint("[init.sys] Process table full\n");
-        kfree(virt_entry);
+        if (image_base) {
+            kfree((void*)image_base);
+        }
         return false;
     }
-    init_proc->image_base = (uint32_t)virt_entry;
-    init_proc->image_size = alloc_size;
+    init_proc->image_base = image_base;
+    init_proc->image_size = image_size;
     proc_set_foreground_pid(init_proc->pid);
 
     enter_user_process(init_proc);
@@ -161,31 +184,47 @@ bool start_init(void) {
 
 static process_t* bin_create_process(const char* path, const char* const* argv, int argc,
                                      bool make_current) {
-    uint32_t phys_entry = 0;
-    uint32_t bin_size   = 0;
+    uint32_t entry = 0;
+    uint32_t image_base = 0;
+    uint32_t image_size = 0;
+    bool is_elf = false;
 
-    if (!load_bin(path, &phys_entry, &bin_size)) {
-        kprintf("Failed to load %s\n", path);
+    if (elf_load_image(path, &entry, &image_base, &image_size, &is_elf)) {
+        kprintf("Executing ELF %s at entry %x\n", path, entry);
+    } else if (is_elf) {
+        kprintf("ELF load failed: %s\n", path);
         return NULL;
-    }
+    } else {
+        uint32_t phys_entry = 0;
+        uint32_t bin_size   = 0;
 
-    uint32_t alloc_size = (bin_size + 0xFFFu) & ~0xFFFu;
-    void* virt_entry = kmalloc(alloc_size, 1, NULL);
-    if (!virt_entry) {
-        kprint("kmalloc failed\n");
-        return NULL;
-    }
+        if (!load_bin(path, &phys_entry, &bin_size)) {
+            kprintf("Failed to load %s\n", path);
+            return NULL;
+        }
 
-    memset(virt_entry, 0, alloc_size);
-    memcpy(virt_entry, (void*)phys_entry, bin_size);
+        uint32_t alloc_size = (bin_size + 0xFFFu) & ~0xFFFu;
+        void* virt_entry = kmalloc(alloc_size, 1, NULL);
+        if (!virt_entry) {
+            kprint("kmalloc failed\n");
+            return NULL;
+        }
 
-    kprintf("Executing %s at virt %x\n", path, (uint32_t)virt_entry);
+        memset(virt_entry, 0, alloc_size);
+        memcpy(virt_entry, (void*)phys_entry, bin_size);
 
-    if (vmm_mark_user_range(BIN_LOAD_ADDR, BIN_MAX_SIZE) != 0 ||
-        vmm_mark_user_range((uint32_t)virt_entry, alloc_size) != 0) {
-        kprint("Failed to mark user pages\n");
-        kfree(virt_entry);
-        return NULL;
+        kprintf("Executing %s at virt %x\n", path, (uint32_t)virt_entry);
+
+        if (vmm_mark_user_range(BIN_LOAD_ADDR, BIN_MAX_SIZE) != 0 ||
+            vmm_mark_user_range((uint32_t)virt_entry, alloc_size) != 0) {
+            kprint("Failed to mark user pages\n");
+            kfree(virt_entry);
+            return NULL;
+        }
+
+        entry = (uint32_t)virt_entry;
+        image_base = (uint32_t)virt_entry;
+        image_size = alloc_size;
     }
 
     const char* argv0 = path ? path : "";
@@ -198,16 +237,18 @@ static process_t* bin_create_process(const char* path, const char* const* argv, 
     }
 
     process_t* bin_proc = make_current
-        ? proc_create_with_args(path, (uint32_t)virt_entry, use_argv, use_argc)
-        : proc_spawn_with_args(path, (uint32_t)virt_entry, use_argv, use_argc);
+        ? proc_create_with_args(path, entry, use_argv, use_argc)
+        : proc_spawn_with_args(path, entry, use_argv, use_argc);
 
     if (!bin_proc) {
         kprint("Process table full\n");
-        kfree(virt_entry);
+        if (image_base) {
+            kfree((void*)image_base);
+        }
         return NULL;
     }
-    bin_proc->image_base = (uint32_t)virt_entry;
-    bin_proc->image_size = alloc_size;
+    bin_proc->image_base = image_base;
+    bin_proc->image_size = image_size;
 
     return bin_proc;
 }

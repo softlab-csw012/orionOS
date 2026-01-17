@@ -73,7 +73,7 @@ test/ramdisk.img: FORCE
 		mcopy -i $@ kernel.elf ::/system/core/orion.ker; \
 		mcopy -i $@ $(LIMINE_CONF) ::/boot/limine.conf; \
 		mcopy -i $@ $(LIMINE_BIOS_SYS) ::/boot/limine-bios.sys; \
-		mcopy -i $@ limine.bin ::/; \
+		mcopy -i $@ boot/limine.bin ::/; \
 		mcopy -i $@ init/init.bin ::/system/core/init.sys; \
 		mcopy -i $@ test/orion.psfu ::/system/font/orion.fnt; \
 		mcopy -i $@ orion.stg ::/system/config/orion.stg; \
@@ -108,17 +108,16 @@ orion.img: init/init.bin kernel.elf test.bin syscall_io.bin test/orion.psfu test
 	sudo mkdir -p mnt/system/font; \
 	sudo mkdir -p mnt/system/config; \
 	sudo mkdir -p mnt/home; \
-	sudo cp kernel.elf mnt/system/core/orion.ker; \
-	sudo cp test/ramdisk.img mnt/boot/; \
 	sudo cp $(LIMINE_CONF) mnt/boot/limine.conf; \
 	sudo cp $(LIMINE_BIOS_SYS) mnt/boot/limine-bios.sys; \
+	sudo cp test/ramdisk.img mnt/boot/; \
+	sudo cp kernel.elf mnt/system/core/orion.ker; \
 	sudo cp init/init.bin mnt/system/core/init.sys; \
 	sudo cp test/orion.psfu mnt/system/font/orion.fnt; \
 	sudo cp orion.stg mnt/system/config/orion.stg; \
 	sudo cp test/motd.txt mnt/system/config/motd.txt; \
 	sudo cp test.bin mnt/home/test.bin; \
-	sudo cp test/app.bin mnt/home/app.bin; \
-	sudo cp syscall_io.bin mnt/home/syscall_io.bin; \
+	sudo cp test/app.elf mnt/home/app.elf; \
 	\
 	echo "[+] Installing Limine bootloader..."; \
 	sudo $(LIMINE_BIN) bios-install $@; \

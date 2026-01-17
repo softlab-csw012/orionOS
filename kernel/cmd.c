@@ -2166,7 +2166,7 @@ static bool dispatch_help(const char *orig_cmd, char *cmd, bool *out_success) {
     kprint("  note <file>          - Edit or view text file\n");
     kprint("  run <script>         - Run a script file\n");
     pause();
-    kprint("  bin <file> [args...] [&] - Run binary (background if &)\n");
+    kprint("  bin <file> [args...] [&] - Run BIN/ELF (background if &)\n");
     kprint("  hex <file>           - Hex dump file contents\n");
     kprint("  wait <sec>           - Sleep for given seconds\n");
     kprint("  font <file>          - Load PSF font (PSF1/PSF2), 'font def' to reset\n");
