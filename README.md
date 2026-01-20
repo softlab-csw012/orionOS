@@ -22,10 +22,17 @@ keyboard/mouse, and basic filesystem tooling).
   AC97/HDA audio
 - RAM disk and simple filesystem utilities
 - QEMU/Bochs-friendly build targets
+- Standalone userspace shell (`cmds/shell.sys`) built on a tiny libc
+
+## Userland notes
+- Independent shell: small userspace shell binary for basic command interaction.
+- olibc: minimal C library for user programs (syscall stubs + small string helpers).
+- AHCI driver: SATA DMA path integrated into the ATA layer.
 
 ## Build
 Prerequisites (typical):
-- i386-elf-gcc / i386-elf-ld toolchain
+- linux (Arch Linux, Debian, etc.)
+- i686-elf-ld / i686-elf-gcc toolchain
 - nasm
 - parted, mkfs.fat
 

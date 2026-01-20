@@ -14,7 +14,6 @@ OBJ = ${C_SOURCES:.c=.o} $(ASM_OBJ)
 LIMINE_BIN = boot/limine
 LIMINE_CONF = limine.conf
 LIMINE_BIOS_SYS = boot/limine-bios.sys
-# dd if=orion.img of=mbr.bin bs=446 count=1
 
 #────────────────────────────────────
 # 툴체인
