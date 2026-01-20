@@ -73,6 +73,41 @@ static inline bool is_fat_sig(const uint8_t *sec, const char *sig8) {
            (memcmp(sec + 0x52, sig8, 8) == 0);    // mkfs.fat 등
 }
 
+static void trim_label(char* s) {
+    size_t len = strlen(s);
+    while (len > 0 && s[len - 1] == ' ')
+        s[--len] = '\0';
+    char* p = s;
+    while (*p == ' ')
+        p++;
+    if (p != s)
+        memmove(s, p, strlen(p) + 1);
+}
+
+static void read_volume_label(uint8_t drive, uint32_t base_lba,
+                              const char* fs_type,
+                              char* out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+    if (strcmp(fs_type, "FAT16") != 0 && strcmp(fs_type, "FAT32") != 0)
+        return;
+
+    uint8_t sec[512];
+    if (!ata_read(drive, base_lba, 1, sec))
+        return;
+
+    uint32_t off = (strcmp(fs_type, "FAT32") == 0) ? 0x47 : 0x2B;
+    char label[12];
+    memcpy(label, sec + off, 11);
+    label[11] = '\0';
+    trim_label(label);
+    if (label[0] == '\0' || strcmp(label, "NO NAME") == 0)
+        return;
+
+    strncpy(out, label, out_len - 1);
+    out[out_len - 1] = '\0';
+}
+
 static inline bool is_xvfs_sig_at(uint8_t drive, uint32_t base_lba) {
     uint8_t sec0[512], sec1[512];
     if (!ata_read(drive, base_lba + 0, 1, sec0)) return false;
@@ -149,6 +184,7 @@ fs_kind_t fs_quick_probe(uint8_t drive, uint32_t *out_base_lba) {
 
 void detect_disks_quick(void) {
     disk_count = 0;
+    ata_refresh_drive_map();
     kprint("[DISK] Quick detection start\n");
 
     for (uint8_t d = 0; d < MAX_DISKS; d++) {
@@ -223,34 +259,46 @@ void cmd_disk_ls() {
         const char* fs = disks[i].fs_type;
         uint32_t base = disks[i].base_lba;
         uint8_t id = disks[i].id;
-        const char* ram_suffix = ramdisk_present(id) ? " (ramdisk)" : "";
-        
-        if (base == 0 && (strcmp(fs, "XVFS") == 0)) {
-            kprintf("  %d#: %s (superfloppy)%s\n", id, fs, ram_suffix);
-            continue;
+        char model[64];
+        char label[12];
+        model[0] = '\0';
+        label[0] = '\0';
+
+        if (!ata_drive_model(id, model, sizeof(model))) {
+            strcpy(model, "Unknown");
         }
-        if (strcmp(fs, "XVFS") == 0) {
-            kprintf("  %d#: %s (base LBA=%u, partitioned)%s\n", id, fs, base, ram_suffix);
-            continue;
+        read_volume_label(id, base, fs, label, sizeof(label));
+
+        kprintf("  %d#: %s on %s", id, fs, model);
+        if (label[0] != '\0') {
+            kprintf(" (%s)", label);
         }
-        if (base == 0 && (strcmp(fs, "FAT16") == 0 || strcmp(fs, "FAT32") == 0)) {
-            kprintf("  %d#: %s (superfloppy)%s\n", id, fs, ram_suffix);
-            continue;
-        }
-        if (strcmp(fs, "FAT16") == 0 || strcmp(fs, "FAT32") == 0) {
-            kprintf("  %d#: %s (base LBA=%u, partitioned)%s\n", id, fs, base, ram_suffix);
-            continue;
-        }
-        if (strcmp(fs, "MBR") == 0) {
-            kprintf("  %d#: MBR (non-FAT partitions present, base LBA=%u)%s\n", id, base, ram_suffix);
-            continue;
-        }
-        if (strcmp(fs, "Unknown") == 0) {
-            kprintf("  %d#: Unknown or unsupported filesystem (base LBA=%u)%s\n", id, base, ram_suffix);
-            continue;
+        kprintf("\n");
+
+        ata_backend_t backend = ATA_BACKEND_NONE;
+        const char* backend_name = "unknown";
+        if (ata_drive_backend(id, &backend, NULL)) {
+            switch (backend) {
+            case ATA_BACKEND_AHCI:
+                backend_name = "ahci";
+                break;
+            case ATA_BACKEND_PATA:
+                backend_name = "pata";
+                break;
+            case ATA_BACKEND_USB:
+                backend_name = "usb";
+                break;
+            case ATA_BACKEND_RAMDISK:
+                backend_name = "ram";
+                break;
+            default:
+                backend_name = "unknown";
+                break;
+            }
         }
 
-        kprintf("  %d#: %s (base LBA=%u)%s\n", id, fs, base, ram_suffix);
+        const char* layout = (base == 0) ? "superfloppy" : "partitioned";
+        kprintf("    %s%d . %s . LBA %u\n", backend_name, id, layout, base);
     }
 
     kprintf("[DISK] Total %d drive(s) detected.\n", disk_count);

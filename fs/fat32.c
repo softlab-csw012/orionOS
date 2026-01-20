@@ -2061,7 +2061,7 @@ bool fat32_cd(const char* path) {
         else {
             uint32_t next = fat32_find_dir_cluster(cluster, segment);
             if (next < 2 || next >= 0x0FFFFFF8) {
-                kprintf("cd: no such directory: %s\n", segment);
+                //kprintf("cd: no such directory: %s\n", segment);
                 return false;
             }
 

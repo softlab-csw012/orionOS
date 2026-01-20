@@ -195,9 +195,8 @@ void parse_cmdline_rd(void) {
 void parse_cmdline_enable_font(void) {
     if (!boot_cmdline) return;
 
-    // "emg_sh" 문자열이 포함되어 있는지?
     if (strstr(boot_cmdline, "enable_font") != NULL) {
-        enable_font = true; // 긴급 셸 모드 활성화 플래그
+        enable_font = true;
         return;
     }
 }
@@ -270,10 +269,6 @@ void parse_bootcmd() {
         m_disk("7");
     }
 
-    if (enable_font) {
-        kprint("[kernel] enabling custom font from bootcmd...\n");
-        try_load_default_font(true);
-    } else {
-        try_load_default_font(false);
-    }
+    kprint("[kernel] enabling custom font from bootcmd...\n");
+    try_load_default_font(true);
 }

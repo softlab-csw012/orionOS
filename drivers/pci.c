@@ -3,6 +3,7 @@
 #include "../drivers/screen.h" // kprintf()
 #include "ac97.h"
 #include "hda.h"
+#include "ahci.h"
 #include "usb/ehci.h"
 #include "usb/ohci.h"
 #include "usb/uhci.h"
@@ -111,6 +112,39 @@ void pci_scan_all_devices(void) {
                     kprintf("       CH0: io=%X ctrl=%X\n", CH[0].io, CH[0].ctrl);
                     kprintf("       CH1: io=%X ctrl=%X\n", CH[1].io, CH[1].ctrl);
                     ide_channels_set = true;
+                }
+
+                // ===========================================
+                //  AHCI Controller (SATA) 감지!
+                // ===========================================
+                if (class_code == 0x01 && subclass == 0x06 && prog_if == 0x01) {
+                    kprintf("       [AHCI Controller Found] SATA AHCI Controller!\n");
+
+                    uint32_t bar5 = pci_read_dword(bus, dev, func, 0x24);
+                    uint32_t mmio_base = 0;
+                    if ((bar5 & 0x1u) == 0) {
+                        mmio_base = bar5 & ~0xFu;
+                    }
+                    if (mmio_base == 0) {
+                        uint32_t bar0 = pci_read_dword(bus, dev, func, 0x10);
+                        if ((bar0 & 0x1u) == 0) {
+                            mmio_base = bar0 & ~0xFu;
+                        }
+                    }
+
+                    if (mmio_base == 0) {
+                        kprint("       AHCI MMIO base is 0, skipping attach\n");
+                    } else {
+                        uint32_t cmdsts = pci_read_dword(bus, dev, func, 0x04);
+                        cmdsts |= (1u << 1) | (1u << 2);
+                        pci_write_dword(bus, dev, func, 0x04, cmdsts);
+
+                        uint32_t irq_reg = pci_read_dword(bus, dev, func, 0x3C);
+                        uint8_t irq_line = irq_reg & 0xFF;
+
+                        kprintf("       AHCI MMIO Base = %08X, IRQ=%d\n", mmio_base, irq_line);
+                        ahci_pci_attach((uint8_t)bus, (uint8_t)dev, (uint8_t)func, mmio_base, irq_line);
+                    }
                 }
 
                 // ===========================================

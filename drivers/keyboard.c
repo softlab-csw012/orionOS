@@ -541,10 +541,10 @@ void allow_all_irqs() {
 }
 
 static void wait_for_note_key(void) {
-    allow_keyboard_only();
     hal_enable_interrupts();
-    while (!g_key_pressed) hal_halt();
-    allow_all_irqs();
+    while (!g_key_pressed) {
+        hal_halt();
+    }
 }
 
 void keyboard_note_debounce(void) {

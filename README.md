@@ -16,9 +16,9 @@ freestanding kernel, and a growing device driver stack (ATA, USB, audio,
 keyboard/mouse, and basic filesystem tooling).
 
 ## Features (selected)
-- Custom MBR + stage2 bootloader
-- 32-bit freestanding kernel (i386)
-- Basic driver set: ATA/PCI, PS/2 keyboard/mouse, USB (UHCI/OHCI/EHCI/XHCI),
+- limine bootloader
+- 32-bit freestanding kernel (i686)
+- Basic driver set: ATA(PIO+DMA(AHCI))/PCI, PS/2 keyboard/mouse, USB (UHCI/OHCI/EHCI/XHCI),
   AC97/HDA audio
 - RAM disk and simple filesystem utilities
 - QEMU/Bochs-friendly build targets
@@ -39,13 +39,49 @@ Clean objects:
 make clean
 ```
 
-Clean Object file or Bin file:
+Clean Build file:
 ```bash
 make bc
 ```
 ## Run (QEMU)
 ```bash
 make run
+```
+## Version notation
+orionOS uses a structured version notation composed of a major generation number, a stability tag, and a Korean geographical codename.
+
+orionOS [(MAJOR) (STABILITY) ((CODENAME))]  
+kernel: (MAJOR)_(STABILITY)(REVISION)
+
+Components:
+
+MAJOR:
+Major system generation number.
+Incremented when significant architectural, ABI, or kernel-level changes are introduced.
+
+STABILITY:
+Indicates the stability level of the release.
+
+SV – Stable Version
+
+DV – Development Version
+
+EV – Experimental Version
+
+CODENAME:
+A Korean geographical name used as the release codename
+(e.g. Seoul, Busan, Dokdo, Yeoju).
+Codenames are chosen for identification and branding purposes and do not imply
+technical characteristics.
+
+REVISION:
+A sequential number indicating the iteration count of the Stable Version (SV).
+It is incremented each time a new stable release is produced under the same major version.
+
+Example:
+```ver
+orionOS [version 80 SV (YEOJU)]
+kernel: orion 80_SV12
 ```
 
 ## License

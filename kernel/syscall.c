@@ -6,6 +6,7 @@
 #include "log.h"
 #include "bin.h"
 #include "proc/proc.h"
+#include "ramdisk.h"
 #include "config.h"
 #include "../cpu/idt.h"
 #include "../cpu/isr.h"
@@ -13,8 +14,10 @@
 #include "../drivers/screen.h"
 #include "../drivers/spk.h"
 #include "../libc/string.h"
+#include "../mm/mem.h"
 #include "../mm/paging.h"
 #include "../fs/fscmd.h"
+#include "../fs/note.h"
 #include "../fs/disk.h"
 
 #define KERNEL_DS 0x10
@@ -24,10 +27,33 @@
 #define SYS_CLOSE 15
 #define SYS_START_SYSMGR 16
 #define SYS_PRINT_MOTD 17
+#define SYS_SPAWN 18
+#define SYS_WAIT 19
+#define SYS_EXEC 20
+#define SYS_LS 21
+#define SYS_CAT 22
+#define SYS_CHDIR 23
+#define SYS_NOTE 24
+#define SYS_FORK 25
+#define SYS_DISK 26
+#define SH_MOTD 27
+#define SYS_GET_CURSOR_OFFSET 28
+#define SYS_SET_CURSOR_OFFSET 29
 
 #define MAX_OPEN_FILES 16
 #define MAX_PATH_LEN   256
+#define MAX_ARGC       16
 #define EFLAGS_IF      0x200u
+
+#define WAIT_RUNNING   ((uint32_t)-1)
+#define WAIT_NO_SUCH   ((uint32_t)-2)
+
+#define EXEC_ERR_FAULT  ((uint32_t)-1)
+#define EXEC_ERR_NOENT  ((uint32_t)-2)
+#define EXEC_ERR_NOEXEC ((uint32_t)-3)
+#define EXEC_ERR_NOMEM  ((uint32_t)-4)
+#define EXEC_ERR_INVAL  ((uint32_t)-5)
+#define EXEC_ERR_PERM   ((uint32_t)-6)
 
 typedef struct {
     int used;
@@ -103,6 +129,69 @@ static int copy_user_string(char* dst, uint32_t src, uint32_t max_len) {
 
     dst[max_len - 1] = '\0';
     return -1;
+}
+
+static void free_kernel_argv(char** argv, int argc) {
+    if (!argv || argc <= 0) {
+        return;
+    }
+    for (int i = 0; i < argc; i++) {
+        if (argv[i]) {
+            kfree(argv[i]);
+        }
+    }
+    kfree(argv);
+}
+
+static int copy_user_argv(uint32_t argv_ptr, int argc, char*** out_argv) {
+    if (!out_argv) {
+        return -1;
+    }
+    *out_argv = NULL;
+    if (!argv_ptr) {
+        return argc <= 0 ? 0 : -1;
+    }
+    if (argc <= 0) {
+        return 0;
+    }
+    if (argc > MAX_ARGC) {
+        return -1;
+    }
+
+    uint32_t bytes = (uint32_t)argc * sizeof(uint32_t);
+    if (bytes / sizeof(uint32_t) != (uint32_t)argc) {
+        return -1;
+    }
+    if (validate_user_buffer(argv_ptr, bytes) != 0) {
+        return -1;
+    }
+
+    char** argv = (char**)kmalloc(sizeof(char*) * (uint32_t)argc, 0, NULL);
+    if (!argv) {
+        return -1;
+    }
+    for (int i = 0; i < argc; i++) {
+        argv[i] = NULL;
+    }
+
+    uint32_t* user_argv = (uint32_t*)argv_ptr;
+    for (int i = 0; i < argc; i++) {
+        uint32_t user_str = user_argv[i];
+        char* buf = (char*)kmalloc(MAX_PATH_LEN, 0, NULL);
+        if (!buf) {
+            free_kernel_argv(argv, argc);
+            return -1;
+        }
+        if (copy_user_string(buf, user_str, MAX_PATH_LEN) != 0) {
+            kfree(buf);
+            free_kernel_argv(argv, argc);
+            return -1;
+        }
+        argv[i] = buf;
+    }
+
+    *out_argv = argv;
+    return 0;
 }
 
 static int alloc_fd(uint32_t owner_pid) {
@@ -272,12 +361,10 @@ void syscall_handler(registers_t* regs) {
     uint32_t eax = regs->eax;
     uint32_t ebx = regs->ebx;
     uint32_t ecx = regs->ecx;
+    uint32_t edx = regs->edx;
 
     switch (eax) {
         case 1: // start_shell
-            keyboard_input_enabled = true;
-            enable_shell = true;
-            prompt_enabled = true;
             orion_config_load();
             parse_bootcmd();
             bootlog_enabled = false;
@@ -304,7 +391,7 @@ void syscall_handler(registers_t* regs) {
 
         case 6: //getkey
             uint32_t key = getkey();
-            regs->ecx = key;   // 🔥 여기 중요
+            regs->ecx = key;   // 여기 중요
             break;
 
         case 7: //reboot
@@ -480,6 +567,225 @@ void syscall_handler(registers_t* regs) {
             }
             memset(fd, 0, sizeof(*fd));
             regs->eax = 0;
+            break;
+        }
+
+        case SYS_SPAWN: { // spawn(path, argv, argc) -> pid
+            char path[MAX_PATH_LEN];
+            if (copy_user_string(path, ebx, sizeof(path)) != 0) {
+                regs->eax = 0;
+                break;
+            }
+
+            int argc = (int)edx;
+            if (argc < 0) {
+                regs->eax = 0;
+                break;
+            }
+            char** argv = NULL;
+            if (copy_user_argv(ecx, argc, &argv) != 0) {
+                regs->eax = 0;
+                break;
+            }
+
+            process_t* child = bin_create_process(path, (const char* const*)argv, argc, false);
+            regs->eax = child ? child->pid : 0;
+            free_kernel_argv(argv, argc);
+            break;
+        }
+
+        case SYS_WAIT: { // wait(pid) -> exit_code | WAIT_*
+            uint32_t pid = ebx;
+            uint32_t code = 0;
+            if (pid == 0) {
+                regs->eax = WAIT_NO_SUCH;
+                break;
+            }
+            if (proc_pid_exited(pid, &code)) {
+                regs->eax = code;
+                break;
+            }
+            if (!proc_pid_alive(pid)) {
+                regs->eax = WAIT_NO_SUCH;
+                break;
+            }
+            regs->eax = WAIT_RUNNING;
+            break;
+        }
+
+        case SYS_EXEC: { // exec(path, argv, argc) -> no return on success
+            char path[MAX_PATH_LEN];
+            if (copy_user_string(path, ebx, sizeof(path)) != 0) {
+                regs->eax = EXEC_ERR_FAULT;
+                break;
+            }
+
+            int argc = (int)edx;
+            if (argc < 0) {
+                regs->eax = EXEC_ERR_INVAL;
+                break;
+            }
+            char** argv = NULL;
+            if (copy_user_argv(ecx, argc, &argv) != 0) {
+                regs->eax = EXEC_ERR_FAULT;
+                break;
+            }
+
+            uint32_t entry = 0;
+            uint32_t image_base = 0;
+            uint32_t image_size = 0;
+            if (!fscmd_exists(path)) {
+                free_kernel_argv(argv, argc);
+                regs->eax = EXEC_ERR_NOENT;
+                break;
+            }
+            if (!bin_load_image(path, &entry, &image_base, &image_size)) {
+                free_kernel_argv(argv, argc);
+                regs->eax = EXEC_ERR_NOEXEC;
+                break;
+            }
+
+            process_t* cur = proc_current();
+            if (!cur || cur->is_kernel) {
+                free_kernel_argv(argv, argc);
+                if (image_base) {
+                    kfree((void*)image_base);
+                }
+                regs->eax = EXEC_ERR_PERM;
+                break;
+            }
+            if (!proc_exec(cur, entry, image_base, image_size,
+                           (const char* const*)argv, argc)) {
+                free_kernel_argv(argv, argc);
+                if (image_base) {
+                    kfree((void*)image_base);
+                }
+                regs->eax = EXEC_ERR_NOMEM;
+                break;
+            }
+
+            free_kernel_argv(argv, argc);
+            proc_wake_vfork_parent(cur);
+            sched_next_esp = cur->context_esp;
+            regs->eax = 0;
+            break;
+        }
+
+        case SYS_LS: { // ls(path) - prints to console
+            const char* use_path = NULL;
+            char path[MAX_PATH_LEN];
+            if (ebx) {
+                if (copy_user_string(path, ebx, sizeof(path)) != 0) {
+                    regs->eax = 0;
+                    break;
+                }
+                if (path[0] != '\0') {
+                    use_path = path;
+                }
+            }
+            fscmd_ls(use_path);
+            regs->eax = 1;
+            break;
+        }
+
+        case SYS_CAT: { // cat(path) - prints file to console
+            char path[MAX_PATH_LEN];
+            if (!ebx || copy_user_string(path, ebx, sizeof(path)) != 0) {
+                regs->eax = 0;
+                break;
+            }
+            fscmd_cat(path);
+            regs->eax = 1;
+            break;
+        }
+
+        case SYS_CHDIR: { // chdir(path)
+            char path[MAX_PATH_LEN];
+            if (!ebx || copy_user_string(path, ebx, sizeof(path)) != 0) {
+                regs->eax = 0;
+                break;
+            }
+            regs->eax = fscmd_cd(path) ? 1u : 0u;
+            break;
+        }
+
+        case SYS_NOTE: { // note(path)
+            char path[MAX_PATH_LEN];
+            if (!ebx || copy_user_string(path, ebx, sizeof(path)) != 0) {
+                regs->eax = 0;
+                break;
+            }
+            bool prev_kbd = keyboard_input_enabled;
+            note(path);
+            keyboard_input_enabled = prev_kbd;
+            keyboard_flush();
+            regs->eax = 1;
+            break;
+        }
+
+        case SYS_FORK: { // fork() -> pid (parent), 0 (child)
+            process_t* parent = proc_current();
+            process_t* child = proc_fork(regs);
+            if (!child) {
+                regs->eax = (uint32_t)-1;
+                break;
+            }
+            regs->eax = child->pid;
+            if (proc_make_current(child, regs)) {
+                if (parent) {
+                    parent->state = PROC_BLOCKED;
+                }
+                sched_next_esp = child->context_esp;
+            } else {
+                regs->eax = (uint32_t)-1;
+            }
+            break;
+        }
+
+        case SH_MOTD: { // print shell motd
+            kprintf("Currently mounted root disk info: Disk: %d#, FS: %s\n", current_drive, fs_to_string(current_fs));
+
+            if (ramdisk_auto_mount) {
+                kprint("[");
+                kprint_color("warning", 14, 0);
+                kprint("] Disk auto-mount failed and was mounted as a ramdisk.(not persistent)\n");
+            }
+
+            cmd_disk_ls();
+
+            fscmd_cd("/home"); // 기본 디렉토리를 /home으로 변경
+            break;
+        }
+
+        case SYS_GET_CURSOR_OFFSET: {
+            regs->eax = (uint32_t)get_cursor_offset();
+            break;
+        }
+
+        case SYS_SET_CURSOR_OFFSET: {
+            int offset = (int)ebx;
+            int max = screen_get_cols() * screen_get_rows() * 2;
+            if (offset < 0) {
+                offset = 0;
+            } else if (offset >= max) {
+                offset = max > 1 ? max - 2 : 0;
+            }
+            set_cursor_offset(offset);
+            regs->eax = 0;
+            break;
+        }
+
+        case SYS_DISK: { // disk(cmd)
+            char cmd[MAX_PATH_LEN];
+            cmd[0] = '\0';
+            if (ebx) {
+                if (copy_user_string(cmd, ebx, sizeof(cmd)) != 0) {
+                    regs->eax = 0;
+                    break;
+                }
+            }
+            m_disk(cmd);
+            regs->eax = 1;
             break;
         }
 

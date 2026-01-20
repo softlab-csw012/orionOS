@@ -22,9 +22,19 @@ _start:
     mov ebx, motd_path
     mov eax, 17
     int 0xA5
-    
-    mov eax, 8  ;exit
+
+    mov eax, 27
     int 0xA5
+
+    mov ebx, shell_path
+    xor ecx, ecx
+    xor edx, edx
+    mov eax, 20
+    int 0xA5
+
+    ;mov eax, 8  ;exit
+    ;int 0xA5
 
 section .rodata
 motd_path db "/system/config/motd.txt", 0
+shell_path db "/cmd/shell.sys", 0

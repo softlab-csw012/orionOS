@@ -2,6 +2,7 @@
 #include "elf.h"
 #include "kernel.h"
 #include "proc/proc.h"
+#include "proc/sysmgr.h"
 #include "bootcmd.h"
 #include "../drivers/screen.h"
 #include "../drivers/keyboard.h"
@@ -72,6 +73,56 @@ bool load_bin(const char* path, uint32_t* phys_entry, uint32_t* out_size) {
     return true;
 }
 
+bool bin_load_image(const char* path, uint32_t* out_entry, uint32_t* out_image_base,
+                    uint32_t* out_image_size) {
+    if (!path || !out_entry || !out_image_base || !out_image_size) {
+        return false;
+    }
+
+    uint32_t entry = 0;
+    uint32_t image_base = 0;
+    uint32_t image_size = 0;
+    bool is_elf = false;
+
+    if (elf_load_image(path, &entry, &image_base, &image_size, &is_elf)) {
+        *out_entry = entry;
+        *out_image_base = image_base;
+        *out_image_size = image_size;
+        return true;
+    }
+    if (is_elf) {
+        return false;
+    }
+
+    uint32_t phys_entry = 0;
+    uint32_t bin_size = 0;
+    if (!load_bin(path, &phys_entry, &bin_size)) {
+        return false;
+    }
+
+    uint32_t alloc_size = (bin_size + 0xFFFu) & ~0xFFFu;
+    void* virt_entry = kmalloc(alloc_size, 1, NULL);
+    if (!virt_entry) {
+        kprint("kmalloc failed\n");
+        return false;
+    }
+
+    memset(virt_entry, 0, alloc_size);
+    memcpy(virt_entry, (void*)phys_entry, bin_size);
+
+    if (vmm_mark_user_range(BIN_LOAD_ADDR, BIN_MAX_SIZE) != 0 ||
+        vmm_mark_user_range((uint32_t)virt_entry, alloc_size) != 0) {
+        kprint("Failed to mark user pages\n");
+        kfree(virt_entry);
+        return false;
+    }
+
+    *out_entry = (uint32_t)virt_entry;
+    *out_image_base = (uint32_t)virt_entry;
+    *out_image_size = alloc_size;
+    return true;
+}
+
 // ======================================================
 // 4) BIN 코드 점프
 // ======================================================
@@ -92,6 +143,8 @@ void bin_return_to_shell(void) {
     keyboard_input_enabled = true;
     enable_shell = true;
     prompt_enabled = true;
+    shell_suspended = false;
+    sysmgr_request_prompt();
 }
 
 __attribute__((naked)) void bin_exit_trampoline(void) {
@@ -182,8 +235,8 @@ bool start_init(void) {
     return true;
 }
 
-static process_t* bin_create_process(const char* path, const char* const* argv, int argc,
-                                     bool make_current) {
+process_t* bin_create_process(const char* path, const char* const* argv, int argc,
+                              bool make_current) {
     uint32_t entry = 0;
     uint32_t image_base = 0;
     uint32_t image_size = 0;

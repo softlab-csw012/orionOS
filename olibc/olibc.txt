@@ -1,0 +1,1 @@
+orionOS전용 libc

@@ -1,25 +1,30 @@
 [bits 32]
 [org 0x500000]
-global start
 
 start:
-    mov eax, 2
-    mov ebx, test
+    mov eax, 12
+    mov ebx, con
     int 0xA5
 
-    ;mov eax, 5 
-    ;int 0xA5
+    mov [fd], eax
 
-    mov eax, 4
-    mov ebx, 600
-    mov ecx, 30000
+    mov eax, 14
+    mov ebx, [fd]
+    mov edx, msg
+    mov ecx, len
     int 0xA5
-    
-    ret
-    ;mov eax, 8
-    ;int 0xA5
 
-;loop:
-;    jmp loop
+    mov eax, 15
+    mov ebx, [fd]
+    int 0xA5
 
-test: db "123", 10, 0
+    mov eax, 8
+    mov ebx, 0
+    int 0xA5
+
+con: db "console", 0
+
+msg: db "Hello, world!", 10
+len equ $ - msg
+
+fd: dd 0

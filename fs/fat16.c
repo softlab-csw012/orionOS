@@ -1897,7 +1897,7 @@ bool fat16_cd(const char* path) {
 
     uint16_t cluster = fat16_resolve_dir(normalized);
     if (cluster == 0xFFFF) {
-        kprintf("Directory not found: %s\n", path);
+        //kprintf("Directory not found: %s\n", path);
         return false;
     }
 

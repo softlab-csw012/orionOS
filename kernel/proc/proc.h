@@ -12,6 +12,7 @@ typedef enum {
     PROC_UNUSED = 0,
     PROC_READY,
     PROC_RUNNING,
+    PROC_BLOCKED,
     PROC_EXITED
 } proc_state_t;
 
@@ -27,6 +28,7 @@ typedef struct {
     uint32_t kstack_size;
     uint32_t context_esp;
     uint32_t exit_code;
+    uint32_t vfork_parent_pid;
     proc_state_t state;
     bool is_kernel;
 } process_t;
@@ -62,6 +64,12 @@ registers_t* proc_get_last_regs(void);
 void proc_set_foreground_pid(uint32_t pid);
 uint32_t proc_get_foreground_pid(void);
 bool proc_is_foreground_pid(uint32_t pid);
+bool proc_pid_alive(uint32_t pid);
+bool proc_pid_exited(uint32_t pid, uint32_t* exit_code);
+process_t* proc_fork(registers_t* regs);
+bool proc_exec(process_t* p, uint32_t entry, uint32_t image_base, uint32_t image_size,
+               const char* const* argv, int argc);
+void proc_wake_vfork_parent(process_t* child);
 bool proc_make_current(process_t* p, registers_t* regs);
 bool proc_schedule(registers_t* regs, bool save_current);
 bool proc_has_runnable(void);

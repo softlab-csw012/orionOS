@@ -22,8 +22,21 @@ LIMINE_BIOS_SYS = boot/limine-bios.sys
 CC = i686-elf-gcc
 LD = i686-elf-ld
 GDB = i686-elf-gdb
+
+AR = ar
 CFLAGS = -g -ffreestanding -Wall -Wextra -fno-exceptions -fno-pic -fno-pie -fno-stack-protector -m32 -nostdlib
 LDFLAGS = -T link.ld -m elf_i386
+OLIBC_DIR = $(CURDIR)/olibc
+OLIBC_LIB = $(OLIBC_DIR)/olibc.a
+OLIBC_LD = $(OLIBC_DIR)/app.ld
+OLIBC_OBJS = $(OLIBC_DIR)/syscall.o $(OLIBC_DIR)/string.o
+SHELL_CFLAGS = -g -ffreestanding -Wall -Wextra -fno-exceptions -fno-pic -fPIE -fno-stack-protector -m32 -nostdlib -I$(OLIBC_DIR)
+USER_LDFLAGS = -T $(OLIBC_LD) -pie
+SHELL_DIR = cmds
+SHELL_SRC = $(SHELL_DIR)/shell.c
+SHELL_OBJ = $(SHELL_DIR)/shell.o
+SHELL_BIN = $(SHELL_DIR)/shell.sys
+
 #────────────────────────────────────
 # 빌드 타겟
 #────────────────────────────────────
@@ -43,9 +56,6 @@ init/init.bin: init/init.asm
 
 test.bin: test/test.asm
 	nasm -f bin test/test.asm -o test.bin
-
-syscall_io.bin: test/syscall_io.asm
-	nasm -f bin test/syscall_io.asm -o syscall_io.bin
 	
 test/ramdisk.img: FORCE
 	@need_init=0; \
@@ -69,23 +79,26 @@ test/ramdisk.img: FORCE
 		mmd -i $@ ::/system/core; \
 		mmd -i $@ ::/system/font; \
 		mmd -i $@ ::/system/config; \
+		mmd -i $@ ::/cmd; \
 		mmd -i $@ ::/home; \
 		mcopy -i $@ kernel.elf ::/system/core/orion.ker; \
 		mcopy -i $@ $(LIMINE_CONF) ::/boot/limine.conf; \
 		mcopy -i $@ $(LIMINE_BIOS_SYS) ::/boot/limine-bios.sys; \
 		mcopy -i $@ boot/limine.bin ::/; \
 		mcopy -i $@ init/init.bin ::/system/core/init.sys; \
+		if [ -f $(SHELL_BIN) ]; then \
+			mcopy -i $@ $(SHELL_BIN) ::/cmd/shell.sys; \
+		fi; \
 		mcopy -i $@ test/orion.psfu ::/system/font/orion.fnt; \
 		mcopy -i $@ orion.stg ::/system/config/orion.stg; \
 		mcopy -i $@ test/motd.txt ::/system/config/motd.txt; \
 		mcopy -i $@ test.bin ::/home/test.bin; \
-		mcopy -i $@ syscall_io.bin ::/home/syscall_io.bin; \
 	fi;
 
 #────────────────────────────────────
 # Limine용 IMG 이미지 생성 (MBR + FAT32 + /boot/orion.ker)
 #────────────────────────────────────
-orion.img: init/init.bin kernel.elf test.bin syscall_io.bin test/orion.psfu test/123.wav test/1.wav test/ramdisk.img $(LIMINE_CONF) $(LIMINE_BIOS_SYS) $(LIMINE_BIOS_HDD) | $(LIMINE_BIN)
+orion.img: init/init.bin kernel.elf $(SHELL_BIN) test.bin test/orion.psfu test/123.wav test/1.wav test/ramdisk.img $(LIMINE_CONF) $(LIMINE_BIOS_SYS) $(LIMINE_BIOS_HDD) | $(LIMINE_BIN)
 	@echo "[+] Creating 512MB disk image..."
 	dd if=/dev/zero of=$@ bs=1M count=512 status=none
 
@@ -107,6 +120,7 @@ orion.img: init/init.bin kernel.elf test.bin syscall_io.bin test/orion.psfu test
 	sudo mkdir -p mnt/system/core; \
 	sudo mkdir -p mnt/system/font; \
 	sudo mkdir -p mnt/system/config; \
+	sudo mkdir -p mnt/cmd; \
 	sudo mkdir -p mnt/home; \
 	sudo cp $(LIMINE_CONF) mnt/boot/limine.conf; \
 	sudo cp $(LIMINE_BIOS_SYS) mnt/boot/limine-bios.sys; \
@@ -116,6 +130,9 @@ orion.img: init/init.bin kernel.elf test.bin syscall_io.bin test/orion.psfu test
 	sudo cp test/orion.psfu mnt/system/font/orion.fnt; \
 	sudo cp orion.stg mnt/system/config/orion.stg; \
 	sudo cp test/motd.txt mnt/system/config/motd.txt; \
+	if [ -f $(SHELL_BIN) ]; then \
+		sudo cp $(SHELL_BIN) mnt/cmd/shell.sys; \
+	fi; \
 	sudo cp test.bin mnt/home/test.bin; \
 	sudo cp test/app.elf mnt/home/app.elf; \
 	\
@@ -130,39 +147,16 @@ orion.img: init/init.bin kernel.elf test.bin syscall_io.bin test/orion.psfu test
 # QEMU 실행
 #────────────────────────────────────
 run: orion.img
-	qemu-system-x86_64 -m 1G \
-		-drive format=raw,file=orion.img -boot c \
-		-drive format=raw,file=test/disk.img,if=ide,index=1,media=disk \
+	qemu-system-x86_64 -m 1G -boot c \
+		-drive file=orion.img,format=raw,if=ide,id=disk0 \
+		\
 		-drive format=raw,file=test/xvfs.img,if=ide,index=2,media=disk \
 		-audiodev pa,id=snd0 -machine pcspk-audiodev=snd0 \
 		\
 		-device qemu-xhci,id=xhci0 \
 		-device usb-ehci,id=ehci0 \
-		-device usb-kbd,bus=ehci0.0,port=1 \
-		-device usb-mouse,bus=ehci0.0,port=2
-
-run_hotplug: orion.img
-	qemu-system-i386 -m 1G \
-		-drive format=raw,file=orion.img -boot c \
-		-drive format=raw,file=test/disk.img,if=ide,index=1,media=disk \
-		-drive format=raw,file=test/xvfs.img,if=ide,index=2,media=disk \
-		-audiodev pa,id=snd0 -machine pcspk-audiodev=snd0 \
-		\
-		-device qemu-xhci,id=xhci0 \
-		-device usb-ehci,id=ehci0 \
-		-monitor stdio
-
-run2: orion.img
-	qemu-system-i386 -m 512M -cpu pentium2 \
-		-drive format=raw,file=test/xvfs.img,if=ide,index=0,media=disk -boot menu=on\
-		-drive format=raw,file=test/disk.img,if=ide,index=1,media=disk \
-		-device usb-ehci,id=ehci0 \
-		-device usb-storage,bus=ehci0.0,drive=usbdisk \
-		-drive if=none,id=usbdisk,format=raw,file=orion.img \
-		-audiodev pa,id=snd0 -machine pcspk-audiodev=snd0 \
-		
-brun: orionos.img disk.img
-	bochs -f bochsrc -q
+		-device usb-kbd,bus=xhci0.0,port=1 \
+		-device usb-mouse,bus=xhci0.0,port=2
 
 dev: orion.img
 	qemu-system-x86_64 \
@@ -191,6 +185,21 @@ debug: orionos.iso kernel.elf
 #────────────────────────────────────
 # 공통 규칙
 #────────────────────────────────────
+$(SHELL_OBJ): $(SHELL_SRC)
+	${CC} ${SHELL_CFLAGS} -c $< -o $@
+
+$(OLIBC_DIR)/syscall.o: $(OLIBC_DIR)/syscall.c
+	${CC} ${SHELL_CFLAGS} -c $< -o $@
+
+$(OLIBC_DIR)/string.o: $(OLIBC_DIR)/string.c
+	${CC} ${SHELL_CFLAGS} -c $< -o $@
+
+$(OLIBC_LIB): $(OLIBC_OBJS)
+	${AR} rcs $@ $^
+
+$(SHELL_BIN): $(SHELL_OBJ) $(OLIBC_LIB)
+	${CC} ${SHELL_CFLAGS} $(USER_LDFLAGS) -o $@ $< $(OLIBC_LIB)
+
 %.o: %.c ${HEADERS}
 	${CC} ${CFLAGS} -c $< -o $@
 
@@ -199,10 +208,10 @@ debug: orionos.iso kernel.elf
 
 clean:
 	rm -rf $(filter-out limine.bin,$(wildcard *.bin))
-	rm -rf *.o *.elf orion.img orion.iso
+	rm -rf *.o *.elf $(SHELL_BIN) $(SHELL_OBJ) orion.img orion.iso
 	rm -rf kernel/*.o kernel/proc/*.o boot/*.o drivers/*.o drivers/usb/*.o cpu/*.o libc/*.o fs/*.o mm/*.o init/*.bin test/ramdisk.img
 
 bc:
 	rm -rf $(filter-out limine.bin,$(wildcard *.bin))
-	rm -rf *.o *.elf
+	rm -rf *.o *.elf $(SHELL_BIN) $(SHELL_OBJ)
 	rm -rf kernel/*.o boot/*.o drivers/*.o drivers/usb/*.o cpu/*.o libc/*.o fs/*.o mm/*.o init/*.bin test/ramdisk.img

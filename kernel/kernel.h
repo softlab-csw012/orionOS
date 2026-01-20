@@ -11,6 +11,8 @@ extern uint32_t g_mb_info_addr;
 extern bool prompt_enabled;
 extern bool enable_shell;
 extern bool script_running;
+extern bool ramdisk_auto_mount;
+extern bool shell_suspended;
 
 void prompt();
 void user_input(char *input);

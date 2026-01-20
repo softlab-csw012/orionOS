@@ -43,6 +43,7 @@ bool prompt_enabled = false;
 bool enable_shell = false;
 bool script_running = false;
 bool ramdisk_auto_mount = false;
+bool shell_suspended = false;
 extern uint8_t _kernel_end;
 extern int current_drive;
 
@@ -138,20 +139,7 @@ void kernel_main(uint32_t magic, uint32_t addr) {
     mouse_init();
     kprint("Ready to run init.sys.\n");
     start_init();
-    // ======== 셸 시작 ========
-
-    kprintf("Currently mounted root disk info: Disk: %d#, FS: %s\n", current_drive, fs_to_string(current_fs));
-
-    if (ramdisk_auto_mount) {
-        kprint("[");
-        kprint_color("warning", 14, 0);
-        kprint("] Disk auto-mount failed and was mounted as a ramdisk.(not persistent)\n");
-    }
-
-    cmd_disk_ls();
-
-    fscmd_cd("/home"); // 기본 디렉토리를 /home으로 변경
-
+    
     sysmgr_request_prompt();
     
     sysmgr_idle_loop();
@@ -265,8 +253,12 @@ void user_input(char *input) {
     }
 
     if (!script_running) {
-        keyboard_input_enabled = true;
-        prompt();
+        if (!shell_suspended) {
+            keyboard_input_enabled = true;
+            prompt();
+        } else {
+            keyboard_input_enabled = false;
+        }
     } else {
         keyboard_input_enabled = false;
     }

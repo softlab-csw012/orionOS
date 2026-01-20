@@ -19,6 +19,7 @@
 #include "kernel.h"
 #include "bin.h"
 #include "proc/proc.h"
+#include "proc/sysmgr.h"
 #include "log.h"
 #include "run.h"
 #include "../libc/string.h"
@@ -228,6 +229,14 @@ void msleep(uint32_t millisecond) {
     }
 }
 
+void wj(void) {
+    kprint_color("Y", 2, 0);
+    kprint_color("E", 9, 0);
+    kprint_color("O", 12, 0);
+    kprint_color("J", 14, 0);
+    kprint_color("U", 15, 0);
+}
+
 //ver
 void ver() {
     kprint_color("             I                 OO    SS   \n", 9, 0);
@@ -246,13 +255,14 @@ void ver() {
     putchar_color(0x84, 1, 15);
     putchar_color(0x85, 4, 15);
     putchar_color(0x86, 0, 15);
-	kprint("\norionOS [version 70 SV (");
-    kprint_color("ULSAN", 11, 0);
+	kprint("\norionOS [version 80 SV (");
+    //kprint_color("");
+    wj();
     kprint(")]");
-    kprint("\nkernel: orion 70_SV10");
+    kprint("\nkernel: orion 80_SV12 (rev 20260121)");
     kprint("\nbootloader: LIMINE");
     kprint("\nprotocol: multiboot2");
-	kprint("\nCopyright (c) 2025 softlab. Licensed under OPL & BSD v1.0.");
+	kprint("\nCopyright (c) 2026 Softlab. Licensed under OPL & BSD v1.0.");
     kprint("\nmade by csw012");
     kprint("\n");
 }
@@ -2166,6 +2176,7 @@ static bool dispatch_help(const char *orig_cmd, char *cmd, bool *out_success) {
     kprint("  note <file>          - Edit or view text file\n");
     kprint("  run <script>         - Run a script file\n");
     pause();
+    kprint("  sh                   - Switch to user shell (/cmd/shell.sys)\n");
     kprint("  bin <file> [args...] [&] - Run BIN/ELF (background if &)\n");
     kprint("  hex <file>           - Hex dump file contents\n");
     kprint("  wait <sec>           - Sleep for given seconds\n");
@@ -2464,6 +2475,41 @@ static bool dispatch_ac97_hda(const char *orig_cmd, char *cmd, bool *out_success
     return true;
 }
 
+static bool dispatch_sh(const char *orig_cmd, char *cmd, bool *out_success) {
+    (void)orig_cmd;
+    if (strncmp(cmd, "sh", 2) != 0)
+        return false;
+
+    const char* args = cmd + 2;
+    while (*args == ' ' || *args == '\t') args++;
+
+    bool background = false;
+    if (*args != '\0') {
+        if (*args == '&') {
+            args++;
+            while (*args == ' ' || *args == '\t') args++;
+            if (*args != '\0') {
+                return false;
+            }
+            background = true;
+        } else {
+            return false;
+        }
+    }
+
+    if (background) {
+        kprint("sh: background not supported; running foreground\n");
+    }
+
+    sysmgr_request_user_shell(false);
+    keyboard_input_enabled = false;
+    prompt_enabled = false;
+    shell_suspended = true;
+
+    *out_success = true;
+    return true;
+}
+
 static bool dispatch_bin(const char *orig_cmd, char *cmd, bool *out_success) {
     if (strncmp(cmd, "bin ", 4) != 0)
         return false;
@@ -2511,8 +2557,14 @@ static bool dispatch_bin(const char *orig_cmd, char *cmd, bool *out_success) {
             success = false;
         }
     } else {
-        start_bin(argv[0], (const char* const*)argv, argc);
-        kprint("\n");
+        if (!sysmgr_request_exec(argv[0], (const char* const*)argv, argc, false)) {
+            kprint("bin: busy\n");
+            success = false;
+        } else {
+            keyboard_input_enabled = false;
+            prompt_enabled = false;
+            shell_suspended = true;
+        }
     }
     *out_success = success;
     return true;
@@ -2911,6 +2963,7 @@ bool execute_single_command(const char *orig_cmd, char *cmd) {
         {dispatch_mkimg},
         {dispatch_beep},
         {dispatch_ac97_hda},
+        {dispatch_sh},
         {dispatch_bin},
         {dispatch_hex},
         {dispatch_mv},

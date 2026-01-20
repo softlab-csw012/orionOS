@@ -26,6 +26,7 @@ static int proc_find_next(int start);
 static bool build_kernel_frame(process_t* p, uint32_t entry);
 static process_t* proc_create_kernel_common(const char* name, uint32_t entry,
                                             bool make_current);
+void proc_wake_vfork_parent(process_t* child);
 
 static void sysmgr_watchdog_thread(void);
 #define PROC_STACK_SIZE 16384
@@ -324,6 +325,7 @@ void proc_exit(uint32_t exit_code) {
     }
     current_proc->exit_code = exit_code;
     current_proc->state = PROC_EXITED;
+    proc_wake_vfork_parent(current_proc);
     if (proc_reaper_enabled) {
         proc_reap_pending = true;
     }
@@ -363,6 +365,227 @@ bool proc_is_foreground_pid(uint32_t pid) {
     return pid != 0 && foreground_pid == pid;
 }
 
+bool proc_pid_alive(uint32_t pid) {
+    if (pid == 0) {
+        return false;
+    }
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (proc_table[i].pid != pid) {
+            continue;
+        }
+        return proc_table[i].state != PROC_UNUSED && proc_table[i].state != PROC_EXITED;
+    }
+    return false;
+}
+
+bool proc_pid_exited(uint32_t pid, uint32_t* exit_code) {
+    if (pid == 0) {
+        return false;
+    }
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (proc_table[i].pid != pid) {
+            continue;
+        }
+        if (proc_table[i].state != PROC_EXITED) {
+            return false;
+        }
+        if (exit_code) {
+            *exit_code = proc_table[i].exit_code;
+        }
+        return true;
+    }
+    return false;
+}
+
+void proc_wake_vfork_parent(process_t* child) {
+    if (!child || child->vfork_parent_pid == 0) {
+        return;
+    }
+    uint32_t parent_pid = child->vfork_parent_pid;
+    child->vfork_parent_pid = 0;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        process_t* p = &proc_table[i];
+        if (p->pid != parent_pid) {
+            continue;
+        }
+        if (p->state == PROC_BLOCKED) {
+            p->state = PROC_READY;
+        }
+        break;
+    }
+}
+
+static void fixup_forked_stack_frames(uint32_t child_base, uint32_t parent_base,
+                                      uint32_t size, uint32_t child_ebp) {
+    if (size == 0 || child_ebp == 0) {
+        return;
+    }
+
+    uint32_t child_end = child_base + size;
+    uint32_t parent_end = parent_base + size;
+    if (child_end < child_base || parent_end < parent_base) {
+        return;
+    }
+    if (child_ebp < child_base || child_ebp >= child_end) {
+        return;
+    }
+
+    int64_t delta = (int64_t)child_base - (int64_t)parent_base;
+    uint32_t ebp = child_ebp;
+    uint32_t max_frames = size / sizeof(uint32_t);
+
+    for (uint32_t i = 0; i < max_frames; i++) {
+        if (ebp < child_base || ebp + sizeof(uint32_t) > child_end) {
+            break;
+        }
+        uint32_t saved = *(uint32_t*)ebp;
+        if (saved < parent_base || saved >= parent_end) {
+            break;
+        }
+        uint32_t new_saved = (uint32_t)((int64_t)saved + delta);
+        if (new_saved < child_base || new_saved >= child_end) {
+            break;
+        }
+        *(uint32_t*)ebp = new_saved;
+        if (new_saved <= ebp) {
+            break;
+        }
+        ebp = new_saved;
+    }
+}
+
+process_t* proc_fork(registers_t* regs) {
+    if (!current_proc || !regs || current_proc->is_kernel) {
+        return NULL;
+    }
+
+    process_t* child = NULL;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (proc_table[i].state == PROC_UNUSED || proc_table[i].state == PROC_EXITED) {
+            child = &proc_table[i];
+            break;
+        }
+    }
+    if (!child) {
+        return NULL;
+    }
+
+    proc_cleanup(child);
+    child->is_kernel = false;
+    child->pid = next_pid++;
+    child->entry = current_proc->entry;
+    child->image_base = 0;
+    child->image_size = 0;
+    child->vfork_parent_pid = current_proc->pid;
+
+    child->kstack_size = PROC_KSTACK_SIZE;
+    child->kstack_base = (uint32_t)kmalloc(child->kstack_size, 1, NULL);
+    if (!child->kstack_base) {
+        child->state = PROC_UNUSED;
+        return NULL;
+    }
+
+    uint32_t kstack_top = child->kstack_base + child->kstack_size;
+    registers_t* frame = (registers_t*)(kstack_top - sizeof(registers_t));
+    memcpy(frame, regs, sizeof(*frame));
+    frame->eax = 0;
+
+    child->stack_base = 0;
+    child->stack_size = 0;
+    if (current_proc->stack_base && current_proc->stack_size) {
+        child->stack_size = current_proc->stack_size;
+        child->stack_base = (uint32_t)kmalloc(child->stack_size, 1, NULL);
+        if (!child->stack_base) {
+            kfree((void*)child->kstack_base);
+            child->kstack_base = 0;
+            child->state = PROC_UNUSED;
+            return NULL;
+        }
+        memcpy((void*)child->stack_base, (void*)current_proc->stack_base, child->stack_size);
+        if (vmm_mark_user_range(child->stack_base, child->stack_size) != 0) {
+            kfree((void*)child->stack_base);
+            kfree((void*)child->kstack_base);
+            child->stack_base = 0;
+            child->kstack_base = 0;
+            child->state = PROC_UNUSED;
+            return NULL;
+        }
+        uint32_t parent_stack_base = current_proc->stack_base;
+        uint32_t parent_stack_end = parent_stack_base + current_proc->stack_size;
+        if (parent_stack_end >= parent_stack_base &&
+            regs->esp >= parent_stack_base && regs->esp <= parent_stack_end) {
+            uint32_t offset = regs->esp - parent_stack_base;
+            frame->esp = child->stack_base + offset;
+        }
+        if (parent_stack_end >= parent_stack_base &&
+            regs->ebp >= parent_stack_base && regs->ebp < parent_stack_end) {
+            uint32_t offset = regs->ebp - parent_stack_base;
+            frame->ebp = child->stack_base + offset;
+            fixup_forked_stack_frames(child->stack_base, parent_stack_base,
+                                      child->stack_size, frame->ebp);
+        }
+    }
+    child->context_esp = (uint32_t)frame;
+
+    if (current_proc->name[0]) {
+        strncpy(child->name, current_proc->name, PROC_NAME_MAX - 1);
+        child->name[PROC_NAME_MAX - 1] = '\0';
+    }
+
+    child->state = PROC_READY;
+    return child;
+}
+
+bool proc_exec(process_t* p, uint32_t entry, uint32_t image_base, uint32_t image_size,
+               const char* const* argv, int argc) {
+    if (!p || p->is_kernel) {
+        return false;
+    }
+
+    uint32_t old_stack_base = p->stack_base;
+    uint32_t old_stack_size = p->stack_size;
+    uint32_t old_image_base = p->image_base;
+    uint32_t old_image_size = p->image_size;
+    uint32_t old_entry = p->entry;
+
+    p->stack_size = PROC_STACK_SIZE;
+    p->stack_base = (uint32_t)kmalloc(p->stack_size, 1, NULL);
+    if (!p->stack_base) {
+        p->stack_base = old_stack_base;
+        p->stack_size = old_stack_size;
+        return false;
+    }
+    memset((void*)p->stack_base, 0, p->stack_size);
+    if (vmm_mark_user_range(p->stack_base, p->stack_size) != 0) {
+        kfree((void*)p->stack_base);
+        p->stack_base = old_stack_base;
+        p->stack_size = old_stack_size;
+        return false;
+    }
+
+    p->entry = entry;
+    p->image_base = image_base;
+    p->image_size = image_size;
+
+    if (!build_initial_frame(p, entry, argv, argc)) {
+        kfree((void*)p->stack_base);
+        p->stack_base = old_stack_base;
+        p->stack_size = old_stack_size;
+        p->image_base = old_image_base;
+        p->image_size = old_image_size;
+        p->entry = old_entry;
+        return false;
+    }
+
+    if (old_stack_base) {
+        kfree((void*)old_stack_base);
+    }
+    if (old_image_base) {
+        kfree((void*)old_image_base);
+    }
+    return true;
+}
+
 static int proc_index_of(const process_t* p) {
     if (!p) {
         return -1;
@@ -391,9 +614,13 @@ bool proc_make_current(process_t* p, registers_t* regs) {
         return true;
     }
     if (current_proc && !regs) {
-        return false;
-    }
-    if (current_proc) {
+        if (!current_proc->context_esp) {
+            return false;
+        }
+        if (current_proc->state == PROC_RUNNING) {
+            current_proc->state = PROC_READY;
+        }
+    } else if (current_proc) {
         current_proc->context_esp = (uint32_t)regs;
         if (current_proc->state == PROC_RUNNING) {
             current_proc->state = PROC_READY;
@@ -490,6 +717,7 @@ proc_kill_result_t proc_kill(uint32_t pid, bool force) {
         }
         proc_table[i].exit_code = 0;
         proc_table[i].state = PROC_EXITED;
+        proc_wake_vfork_parent(&proc_table[i]);
         if (proc_reaper_enabled) {
             proc_reap_pending = true;
         }

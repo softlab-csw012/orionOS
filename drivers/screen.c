@@ -1052,17 +1052,29 @@ int print_char(char c, int col, int row, char attr) {
 
     int scr_row = get_offset_row(offset);
     int scr_col = get_offset_col(offset);
-    
+
+    if ((uint8_t)c == 0x08) { // backspace
+        if (offset >= 2) {
+            offset -= 2;
+            scr_row = get_offset_row(offset);
+            scr_col = get_offset_col(offset);
+            uint16_t cell = ((uint16_t)attr << 8) | ' ';
+            screen_draw_cell(scr_col, scr_row, cell);
+            screen_update_textbuf_cell(scr_row, scr_col, cell);
+        }
+        set_cursor_offset(offset);
+        return offset;
+    }
+
     /* 문자 출력 */
     if (c == '\n') {
         // 줄바꿈: 커서를 다음 줄 맨 앞으로
         offset = get_offset(0, scr_row + 1);
     } else {
-        uint16_t cell = ((uint16_t)attr << 8) | (uint8_t)((c == 0x08) ? ' ' : c);
+        uint16_t cell = ((uint16_t)attr << 8) | (uint8_t)c;
         screen_draw_cell(scr_col, scr_row, cell);
         screen_update_textbuf_cell(scr_row, scr_col, cell);
-        if (c != 0x08)
-            offset += 2;
+        offset += 2;
     }
 
     /* 화면 넘어가면 VGA 스크롤 (기존 로직) */

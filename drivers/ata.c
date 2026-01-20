@@ -1,6 +1,7 @@
 #include "ata.h"
 #include "pci.h"
 #include "hal.h"
+#include "ahci.h"
 #include "../mm/mem.h"
 #include "../libc/string.h"
 #include "../fs/disk.h"
@@ -34,6 +35,89 @@ ata_chan_t CH[2];
 #define ATA_CTRL_BASE(drive) ((drive) < 2 ? 0x3F6 : 0x376)
 
 bool ata_available[4] = {false, false, false, false};
+// Drive index policy: 0..USB_DRIVE_BASE-1 are internal disks.
+// AHCI SATA ports are mapped first, then remaining slots map to PATA.
+static int8_t drive_to_ahci[USB_DRIVE_BASE];
+static int8_t drive_to_pata[USB_DRIVE_BASE];
+
+static void ata_clear_drive_map(void) {
+    for (int i = 0; i < (int)USB_DRIVE_BASE; i++) {
+        drive_to_ahci[i] = -1;
+        drive_to_pata[i] = -1;
+    }
+}
+
+static void ata_build_drive_map(void) {
+    ata_clear_drive_map();
+
+    uint32_t drive = 0;
+    uint32_t ahci_ports = ahci_sata_port_count();
+    if (ahci_ports > USB_DRIVE_BASE) {
+        kprintf("[ATA] AHCI ports=%u (using first %u)\n", ahci_ports, USB_DRIVE_BASE);
+    }
+
+    for (uint32_t p = 0; p < ahci_ports && drive < USB_DRIVE_BASE; p++) {
+        drive_to_ahci[drive] = (int8_t)p;
+        drive++;
+    }
+
+    for (uint32_t p = 0; p < 4 && drive < USB_DRIVE_BASE; p++) {
+        if (!ata_available[p])
+            continue;
+        drive_to_pata[drive] = (int8_t)p;
+        drive++;
+    }
+
+    for (uint32_t i = 0; i < USB_DRIVE_BASE; i++) {
+        if (drive_to_ahci[i] >= 0) {
+            kprintf("[ATA] drive %u -> AHCI port %d\n", i, drive_to_ahci[i]);
+        } else if (drive_to_pata[i] >= 0) {
+            kprintf("[ATA] drive %u -> PATA %d\n", i, drive_to_pata[i]);
+        }
+    }
+}
+
+void ata_refresh_drive_map(void) {
+    ata_build_drive_map();
+}
+
+bool ata_drive_backend(uint8_t drive, ata_backend_t* out_type, int* out_index) {
+    if (!out_type)
+        return false;
+    *out_type = ATA_BACKEND_NONE;
+    if (out_index)
+        *out_index = -1;
+
+    if (ramdisk_present(drive)) {
+        *out_type = ATA_BACKEND_RAMDISK;
+        if (out_index)
+            *out_index = 0;
+        return true;
+    }
+    if (drive >= USB_DRIVE_BASE) {
+        *out_type = ATA_BACKEND_USB;
+        if (out_index)
+            *out_index = (int)(drive - USB_DRIVE_BASE);
+        return true;
+    }
+    if (drive < USB_DRIVE_BASE) {
+        int8_t ahci_port = drive_to_ahci[drive];
+        if (ahci_port >= 0) {
+            *out_type = ATA_BACKEND_AHCI;
+            if (out_index)
+                *out_index = ahci_port;
+            return true;
+        }
+        int8_t pata_drive = drive_to_pata[drive];
+        if (pata_drive >= 0) {
+            *out_type = ATA_BACKEND_PATA;
+            if (out_index)
+                *out_index = pata_drive;
+            return true;
+        }
+    }
+    return false;
+}
 
 static inline void ata_400ns(uint8_t ch) {
     (void)hal_in8(CH[ch].ctrl);
@@ -87,13 +171,64 @@ static inline void set_dev_lba28(uint8_t drive, uint32_t lba) {
     ata_400ns(ch);
 }
 
+static void ata_id_string(char* out, size_t out_len, const uint16_t* id,
+                          int start, int words) {
+    int pos = 0;
+    for (int i = 0; i < words && pos + 1 < (int)out_len; i++) {
+        uint16_t w = id[start + i];
+        char c1 = (char)(w >> 8);
+        char c2 = (char)(w & 0xFF);
+        if (pos < (int)out_len - 1) out[pos++] = c1;
+        if (pos < (int)out_len - 1) out[pos++] = c2;
+    }
+    while (pos > 0 && (out[pos - 1] == ' ' || out[pos - 1] == '\0'))
+        pos--;
+    out[pos] = '\0';
+}
+
+static bool ata_pata_identify(uint8_t drive, uint16_t* id_data) {
+    if (drive > 3 || !ata_available[drive])
+        return false;
+
+    uint8_t ch = drive >> 1;
+    uint8_t sl = drive & 1;
+
+    ata_disable_irq(ch);
+    hal_out8(CH[ch].io + 6, (uint8_t)(0xA0 | (sl << 4)));
+    ata_400ns(ch);
+
+    hal_out8(CH[ch].io + 2, 0);
+    hal_out8(CH[ch].io + 3, 0);
+    hal_out8(CH[ch].io + 4, 0);
+    hal_out8(CH[ch].io + 5, 0);
+    hal_out8(CH[ch].io + 7, ATA_CMD_IDENTIFY);
+
+    if (wait_not_bsy(ch, 100000)) return false;
+    if (wait_drq(ch, 100000)) return false;
+
+    for (int i = 0; i < 256; i++)
+        id_data[i] = hal_in16(CH[ch].io + 0);
+    ata_400ns(ch);
+    return true;
+}
+
 bool ata_read(uint8_t drive, uint32_t lba, uint16_t count, uint8_t* buffer) {
     if (count == 0) count = 256;        // 256=0 의미
     if (ramdisk_present(drive)) {
         return ramdisk_read(drive, lba, count, buffer);
     }
-    if (drive >= 4) {
+    if (drive >= USB_DRIVE_BASE) {
         return usb_storage_read_sectors(drive, lba, count, buffer);
+    }
+    if (drive < USB_DRIVE_BASE) {
+        int8_t ahci_port = drive_to_ahci[drive];
+        if (ahci_port >= 0) {
+            return ahci_read_port((uint32_t)ahci_port, lba, count, buffer);
+        }
+        int8_t pata_drive = drive_to_pata[drive];
+        if (pata_drive < 0)
+            return false;
+        drive = (uint8_t)pata_drive;
     }
     if (!ata_available[drive]) return false;
 
@@ -127,8 +262,18 @@ bool ata_write(uint8_t drive, uint32_t lba, uint16_t count, const uint8_t* buffe
     if (ramdisk_present(drive)) {
         return ramdisk_write(drive, lba, count, buffer);
     }
-    if (drive >= 4) {
+    if (drive >= USB_DRIVE_BASE) {
         return usb_storage_write_sectors(drive, lba, count, buffer);
+    }
+    if (drive < USB_DRIVE_BASE) {
+        int8_t ahci_port = drive_to_ahci[drive];
+        if (ahci_port >= 0) {
+            return ahci_write_port((uint32_t)ahci_port, lba, count, buffer);
+        }
+        int8_t pata_drive = drive_to_pata[drive];
+        if (pata_drive < 0)
+            return false;
+        drive = (uint8_t)pata_drive;
     }
     if (!ata_available[drive]) return false;
 
@@ -167,8 +312,18 @@ bool ata_flush_cache(uint8_t drive) {
     if (ramdisk_present(drive)) {
         return true;
     }
-    if (drive >= 4) {
+    if (drive >= USB_DRIVE_BASE) {
         return usb_storage_sync(drive);
+    }
+    if (drive < USB_DRIVE_BASE) {
+        int8_t ahci_port = drive_to_ahci[drive];
+        if (ahci_port >= 0) {
+            return true;
+        }
+        int8_t pata_drive = drive_to_pata[drive];
+        if (pata_drive < 0)
+            return false;
+        drive = (uint8_t)pata_drive;
     }
     if (drive > 3 || !ata_available[drive]) return false;
 
@@ -302,12 +457,36 @@ void ata_init_all(void) {
             strcpy(disks[d].fs_type, "None");
         }
     }
+    ata_build_drive_map();
 }
 
 uint32_t ata_get_sector_count(uint8_t drive) {
     if (ramdisk_present(drive))
         return ramdisk_get_sector_count(drive);
-    if (drive >= 4) return usb_storage_get_sector_count(drive);
+    if (drive >= USB_DRIVE_BASE) return usb_storage_get_sector_count(drive);
+    if (drive < USB_DRIVE_BASE) {
+        int8_t ahci_port = drive_to_ahci[drive];
+        if (ahci_port >= 0) {
+            uint16_t id_data[256];
+            if (ahci_identify_port((uint32_t)ahci_port, id_data)) {
+                bool lba48 = (id_data[83] & (1u << 10)) != 0;
+                uint64_t sectors;
+                if (lba48) {
+                    sectors = ((uint64_t)id_data[100]) |
+                              ((uint64_t)id_data[101] << 16) |
+                              ((uint64_t)id_data[102] << 32) |
+                              ((uint64_t)id_data[103] << 48);
+                } else {
+                    sectors = ((uint32_t)id_data[61] << 16) | id_data[60];
+                }
+                return (uint32_t)sectors;
+            }
+        }
+        int8_t pata_drive = drive_to_pata[drive];
+        if (pata_drive < 0)
+            return 0;
+        drive = (uint8_t)pata_drive;
+    }
     if (drive > 3 || !ata_available[drive]) return 0;
 
     uint8_t ch = drive >> 1;
@@ -331,4 +510,41 @@ uint32_t ata_get_sector_count(uint8_t drive) {
     uint32_t total_sectors = ((uint32_t)id_data[61] << 16) | id_data[60];
 
     return total_sectors;
+}
+
+bool ata_drive_model(uint8_t drive, char* out, size_t out_len) {
+    if (!out || out_len == 0)
+        return false;
+    out[0] = '\0';
+
+    ata_backend_t backend = ATA_BACKEND_NONE;
+    int index = -1;
+    if (!ata_drive_backend(drive, &backend, &index))
+        return false;
+
+    if (backend == ATA_BACKEND_RAMDISK) {
+        strncpy(out, "RAMDISK", out_len - 1);
+        out[out_len - 1] = '\0';
+        return true;
+    }
+    if (backend == ATA_BACKEND_USB) {
+        strncpy(out, "USB Storage", out_len - 1);
+        out[out_len - 1] = '\0';
+        return true;
+    }
+    if (backend == ATA_BACKEND_AHCI) {
+        uint16_t id_data[256];
+        if (!ahci_identify_port((uint32_t)index, id_data))
+            return false;
+        ata_id_string(out, out_len, id_data, 27, 20);
+        return out[0] != '\0';
+    }
+    if (backend == ATA_BACKEND_PATA) {
+        uint16_t id_data[256];
+        if (!ata_pata_identify((uint8_t)index, id_data))
+            return false;
+        ata_id_string(out, out_len, id_data, 27, 20);
+        return out[0] != '\0';
+    }
+    return false;
 }
