@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 // 지원되는 파일시스템 타입
 typedef enum {
@@ -21,6 +22,7 @@ extern char current_path[256];
 const char* fs_to_string(fs_type_t type);
 void fscmd_reset_path(void);
 void fscmd_ls(const char* path);
+int fscmd_list_dir(const char* path, char* names, uint8_t* is_dir, uint32_t max_entries, size_t name_len);
 void fscmd_cat(const char* path);
 bool fscmd_rm(const char* path);
 bool fscmd_exists(const char* path);

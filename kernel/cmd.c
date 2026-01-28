@@ -1980,6 +1980,56 @@ static bool dispatch_kill(const char *orig_cmd, char *cmd, bool *out_success) {
     return true;
 }
 
+static bool dispatch_fg(const char *orig_cmd, char *cmd, bool *out_success) {
+    (void)orig_cmd;
+    if (strncmp(cmd, "fg ", 3) != 0)
+        return false;
+
+    const char* arg = cmd + 3;
+    while (*arg == ' ' || *arg == '\t') arg++;
+    if (*arg == '\0') {
+        kprint("Usage: fg <pid>\n");
+        *out_success = false;
+        return true;
+    }
+
+    uint32_t pid = (uint32_t)atoi(arg);
+    process_t* p = proc_lookup(pid);
+    if (!p) {
+        kprint("fg: no such pid\n");
+        *out_success = false;
+        return true;
+    }
+    if (p->is_kernel) {
+        kprint("fg: cannot foreground kernel task\n");
+        *out_success = false;
+        return true;
+    }
+    if (p->state == PROC_BLOCKED) {
+        kprint("fg: process is blocked\n");
+        *out_success = false;
+        return true;
+    }
+
+    proc_set_foreground_pid(pid);
+    keyboard_input_enabled = false;
+    prompt_enabled = false;
+    shell_suspended = true;
+
+    if (!proc_make_current(p, NULL)) {
+        kprint("fg: failed to switch task\n");
+        keyboard_input_enabled = true;
+        prompt_enabled = true;
+        shell_suspended = false;
+        *out_success = false;
+        return true;
+    }
+
+    bin_enter_process(p);
+    *out_success = true;
+    return true;
+}
+
 static bool dispatch_fl(const char *orig_cmd, char *cmd, bool *out_success) {
     if (!(strncmp(cmd, "fl", 2) == 0 && (cmd[2] == '\0' || cmd[2] == ' ')))
         return false;
@@ -2169,6 +2219,7 @@ static bool dispatch_help(const char *orig_cmd, char *cmd, bool *out_success) {
     kprint("  pc                   - Show CPU vendor & brand\n");
     kprint("  ps                   - List processes\n");
     kprint("  kill [-f] <pid>      - Terminate process by pid (kernel with -f)\n");
+    kprint("  fg <pid>             - Bring background process to foreground\n");
     kprint("  ver                  - Show orionOS version\n");
     kprint("  clear                - Clear screen\n");
     kprint("  pause                - Wait for key press\n");
@@ -2177,6 +2228,7 @@ static bool dispatch_help(const char *orig_cmd, char *cmd, bool *out_success) {
     kprint("  run <script>         - Run a script file\n");
     pause();
     kprint("  sh                   - Switch to user shell (/cmd/shell.sys)\n");
+    kprint("  gui                  - Launch GUI shell (/cmd/gui.sys)\n");
     kprint("  bin <file> [args...] [&] - Run BIN/ELF (background if &)\n");
     kprint("  hex <file>           - Hex dump file contents\n");
     kprint("  wait <sec>           - Sleep for given seconds\n");
@@ -2502,6 +2554,32 @@ static bool dispatch_sh(const char *orig_cmd, char *cmd, bool *out_success) {
     }
 
     sysmgr_request_user_shell(false);
+    keyboard_input_enabled = false;
+    prompt_enabled = false;
+    shell_suspended = true;
+
+    *out_success = true;
+    return true;
+}
+
+static bool dispatch_gui(const char *orig_cmd, char *cmd, bool *out_success) {
+    (void)orig_cmd;
+    if (strncmp(cmd, "gui", 3) != 0)
+        return false;
+
+    const char* args = cmd + 3;
+    while (*args == ' ' || *args == '\t') args++;
+    if (*args != '\0') {
+        return false;
+    }
+
+    const char* argv[] = {"/cmd/gui.sys"};
+    if (!sysmgr_request_exec(argv[0], argv, 1, false)) {
+        kprint("gui: busy\n");
+        *out_success = false;
+        return true;
+    }
+
     keyboard_input_enabled = false;
     prompt_enabled = false;
     shell_suspended = true;
@@ -2938,6 +3016,7 @@ bool execute_single_command(const char *orig_cmd, char *cmd) {
         {dispatch_pc},
         {dispatch_ps},
         {dispatch_kill},
+        {dispatch_fg},
         {dispatch_fl},
         {dispatch_vf},
         {dispatch_set},
@@ -2964,6 +3043,7 @@ bool execute_single_command(const char *orig_cmd, char *cmd) {
         {dispatch_beep},
         {dispatch_ac97_hda},
         {dispatch_sh},
+        {dispatch_gui},
         {dispatch_bin},
         {dispatch_hex},
         {dispatch_mv},

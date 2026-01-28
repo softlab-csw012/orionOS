@@ -20,6 +20,12 @@ extern uint32_t page_directory[1024];
 void paging_init(void);
 void map_page(uint32_t* dir, uint32_t virt, uint32_t phys, uint32_t flags);
 void dump_mapping(uint32_t addr);
+uint32_t* paging_kernel_dir(void);
+uint32_t paging_kernel_dir_phys(void);
+uint32_t* paging_current_dir(void);
+uint32_t paging_current_dir_phys(void);
+void paging_set_current_dir(uint32_t* dir, uint32_t phys);
+uint32_t* paging_create_user_dir(uint32_t* out_phys);
 
 // Minimal VMM helpers (kernel address space)
 int vmm_map_page(uint32_t virt, uint32_t phys, uint32_t flags);

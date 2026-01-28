@@ -187,6 +187,40 @@ static bool handle_user_exception(registers_t *r) {
 
     kprintf("[user] killed pid=%u (%s): exception %u (%s)\n",
             pid, name, r->int_no, exception_messages[r->int_no]);
+    kprint("--- USER EXCEPTION DUMP ---\n");
+    kprintf("EIP=%08x  EFLAGS=%08x  ERR=%08x\n", r->eip, r->eflags, r->err_code);
+    kprintf("EAX=%08x  EBX=%08x  ECX=%08x  EDX=%08x\n",
+            r->eax, r->ebx, r->ecx, r->edx);
+    kprintf("ESI=%08x  EDI=%08x  EBP=%08x  ESP=%08x\n",
+            r->esi, r->edi, r->ebp, r->esp);
+    kprintf("CS=%04x  DS=%04x  SS=%04x\n", r->cs, r->ds, r->ss);
+
+    if (r->int_no == 14) {
+        uint32_t cr2;
+        asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        kprintf("Fault Address    : %08x\n", cr2);
+        kprint("Page Fault Flags : ");
+        if (r->err_code & 1) kprint("P "); else kprint("NP ");
+        if (r->err_code & 2) kprint("W "); else kprint("R ");
+        if (r->err_code & 4) kprint("U "); else kprint("S ");
+        if (r->err_code & 8) kprint("RES ");
+        if (r->err_code & 16) kprint("IF ");
+        kprint("\n");
+    }
+
+    if (r->esp) {
+        kprint("--- USER STACK DUMP ---\n");
+        for (int i = 0; i < 8; i++) {
+            uint32_t addr = r->esp + (uint32_t)i * 4u;
+            uint32_t phys = 0;
+            if (vmm_virt_to_phys(addr, &phys) != 0) {
+                kprintf("%08x: <invalid>\n", addr);
+                break;
+            }
+            uint32_t val = *(uint32_t*)addr;
+            kprintf("%08x: %08x\n", addr, val);
+        }
+    }
 
     proc_exit(r->int_no);
     if (foreground) {

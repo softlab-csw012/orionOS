@@ -34,7 +34,7 @@ Prerequisites (typical):
 - linux (Arch Linux, Debian, etc.)
 - i686-elf-ld / i686-elf-gcc toolchain
 - nasm
-- parted, mkfs.fat
+- parted, mkfs.fat, mtools
 
 Build disk image:
 ```bash

@@ -309,7 +309,7 @@ static void invlpg(uint32_t addr) {
 static void map_mmio(uint32_t base) {
     uint32_t start = base & ~0xFFFu;
     for (uint32_t addr = start; addr < start + 0x3000u; addr += 0x1000u) {
-        map_page(page_directory, addr, addr, PAGE_PRESENT | PAGE_RW | PAGE_PCD | PAGE_PWT);
+        vmm_map_page(addr, addr, PAGE_PRESENT | PAGE_RW | PAGE_PCD | PAGE_PWT);
         invlpg(addr);
     }
 }
@@ -761,6 +761,10 @@ bool ehci_async_in_init(ehci_ctrl_t* hc, ehci_async_in_t* x,
     memset(qtd, 0, sizeof(*qtd));
 
     qh_init_ep(qh, addr, ep, mps, speed, false, tt_hub_addr, tt_port);
+    // Interrupt QHs must have a non-zero S-mask to be scheduled by EHCI.
+    if (speed == EHCI_SPEED_HIGH) {
+        qh->ep_cap = 0x01u; // S-mask: microframe 0
+    }
 
     x->qh = qh;
     x->qtd = qtd;

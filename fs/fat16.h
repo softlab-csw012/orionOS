@@ -69,6 +69,7 @@ bool fat16_find_file(const char* filename, FAT16_DirEntry* out_entry);
 bool fat16_find_file_path(const char* path, FAT16_DirEntry* out_entry);
 bool fat16_find_entry(const char* name, uint16_t dir_cluster, FAT16_DirEntry* out);
 bool fat16_find_file_raw(const char* filename, uint32_t* sector_out, uint16_t* offset_out);
+uint16_t fat16_resolve_dir(const char* path);
 void fat16_ls(const char* path);
 void fat16_cat(const char* filename);
 int fat16_create_file(const char* filename, int initial_size);

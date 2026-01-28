@@ -82,4 +82,20 @@ void screen_set_cursor_visible(bool visible);
 void screen_set_cursor_blink(bool enabled);
 void screen_cursor_blink_tick(void);
 
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint32_t bpp;
+    uint32_t bytes_per_pixel;
+    uint32_t font_w;
+    uint32_t font_h;
+} screen_fb_info_t;
+
+bool screen_get_framebuffer_info(screen_fb_info_t* out);
+void screen_fb_fill_rect(int x, int y, int w, int h, uint32_t color);
+void screen_fb_draw_text(int x, int y, const char* text, uint32_t fg, uint32_t bg, bool transparent);
+bool screen_fb_get_pixel(int x, int y, uint32_t* out);
+void screen_fb_set_pixel(int x, int y, uint32_t color);
+
 #endif

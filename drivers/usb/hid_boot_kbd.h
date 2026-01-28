@@ -140,7 +140,8 @@ typedef enum {
 void hid_boot_kbd_init(void);
 bool hid_boot_kbd_add_device(usb_hc_t* hc, uint32_t dev, uint8_t ep0_mps,
                              usb_speed_t speed, uint8_t tt_hub_addr, uint8_t tt_port,
-                             uint8_t iface_num, uint8_t ep, uint16_t mps, uint8_t interval);
+                             uint8_t iface_num, uint8_t ep, uint16_t mps, uint8_t interval,
+                             uint16_t report_len);
 void hid_boot_kbd_poll(void);
 void hid_boot_kbd_drop_device(usb_hc_t* hc, uint32_t dev);
 void hid_boot_kbd_drop_controller(usb_hc_t* hc);

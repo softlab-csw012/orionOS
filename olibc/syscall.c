@@ -1,30 +1,49 @@
 #include "syscall.h"
+#include "string.h"
 #include <stdint.h>
 
 uint32_t sys_call0(uint32_t num) {
     uint32_t ret;
-    asm volatile("int $0xA5" : "=a"(ret) : "a"(num) : "memory", "cc");
+    asm volatile("int $0xA5"
+                 : "=a"(ret)
+                 : "a"(num)
+                 : "memory", "cc", "ebx", "ecx", "edx", "esi", "edi");
     return ret;
 }
 
 uint32_t sys_call1(uint32_t num, uintptr_t arg1) {
     uint32_t ret;
-    asm volatile("int $0xA5" : "=a"(ret) : "a"(num), "b"(arg1) : "memory", "cc");
+    register uintptr_t b asm("ebx") = arg1;
+    asm volatile(
+        "int $0xA5\n"
+        : "=a"(ret), "+b"(b)
+        : "0"(num)
+        : "memory", "cc", "ecx", "edx", "esi", "edi");
     return ret;
 }
 
 uint32_t sys_call2(uint32_t num, uintptr_t arg1, uintptr_t arg2) {
     uint32_t ret;
-    asm volatile("int $0xA5" : "=a"(ret) : "a"(num), "b"(arg1), "c"(arg2) : "memory", "cc");
+    register uintptr_t b asm("ebx") = arg1;
+    register uintptr_t c asm("ecx") = arg2;
+    asm volatile(
+        "int $0xA5\n"
+        : "=a"(ret), "+b"(b), "+c"(c)
+        : "0"(num)
+        : "memory", "cc", "edx", "esi", "edi");
     return ret;
 }
 
 uint32_t sys_call3(uint32_t num, uintptr_t arg1, uintptr_t arg2, uintptr_t arg3) {
     uint32_t ret;
-    asm volatile("int $0xA5"
-                 : "=a"(ret)
-                 : "a"(num), "b"(arg1), "c"(arg2), "d"(arg3)
-                 : "memory", "cc");
+    register uintptr_t b asm("ebx") = arg1;
+    register uintptr_t c asm("ecx") = arg2;
+    register uintptr_t d asm("edx") = arg3;
+    asm volatile(
+        "int $0xA5\n"
+        : "=a"(ret), "+b"(b), "+c"(c), "+d"(d)
+        : "0"(num)
+        : "memory", "cc", "esi", "edi");
     return ret;
 }
 
@@ -49,8 +68,12 @@ void sys_pause(void) {
 }
 
 uint32_t sys_getkey(void) {
+    uint32_t dummy;
     uint32_t key;
-    asm volatile("int $0xA5" : "=c"(key) : "a"(SYS_GETKEY) : "memory", "cc");
+    asm volatile("int $0xA5"
+                 : "=a"(dummy), "=c"(key)
+                 : "0"(SYS_GETKEY)
+                 : "memory", "cc", "ebx", "edx", "esi", "edi");
     return key;
 }
 
@@ -142,4 +165,75 @@ int sys_wait(uint32_t pid) {
 
 int sys_exec(const char* path, const char* const* argv, int argc) {
     return (int)sys_call3(SYS_EXEC, (uintptr_t)path, (uintptr_t)argv, (uintptr_t)argc);
+}
+
+uint32_t sys_getkey_nb(void) {
+    return sys_call0(SYS_GETKEY_NB);
+}
+
+int sys_gui_bind(void) {
+    return (int)sys_call0(SYS_GUI_BIND);
+}
+
+int sys_gui_send(const sys_gui_msg_t* msg) {
+    return (int)sys_call1(SYS_GUI_SEND, (uintptr_t)msg);
+}
+
+int sys_gui_recv(sys_gui_msg_t* msg) {
+    return (int)sys_call1(SYS_GUI_RECV, (uintptr_t)msg);
+}
+
+int sys_dir_list(sys_dir_list_t* req) {
+    return (int)sys_call1(SYS_DIR_LIST, (uintptr_t)req);
+}
+
+int gui_create(int x, int y, int w, int h, const char* title) {
+    sys_gui_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = GUI_MSG_CREATE;
+    msg.a = x;
+    msg.b = y;
+    if (w > 0 && h > 0) {
+        msg.c = (int32_t)GUI_CREATE_PACK_WH(w, h);
+    }
+    if (title && *title) {
+        strncpy(msg.text, title, GUI_MSG_TEXT_MAX - 1);
+        msg.text[GUI_MSG_TEXT_MAX - 1] = '\0';
+    }
+    return sys_gui_send(&msg);
+}
+
+int gui_set_text(const char* text) {
+    sys_gui_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = GUI_MSG_TEXT;
+    if (text && *text) {
+        strncpy(msg.text, text, GUI_MSG_TEXT_MAX - 1);
+        msg.text[GUI_MSG_TEXT_MAX - 1] = '\0';
+    }
+    return sys_gui_send(&msg);
+}
+
+int sys_fb_info(sys_fb_info_t* out) {
+    return (int)sys_call1(SYS_FB_INFO, (uintptr_t)out);
+}
+
+int sys_fb_fill_rect(const sys_fb_rect_t* rect) {
+    return (int)sys_call1(SYS_FB_FILL_RECT, (uintptr_t)rect);
+}
+
+int sys_fb_draw_text(const sys_fb_text_t* text) {
+    return (int)sys_call1(SYS_FB_DRAW_TEXT, (uintptr_t)text);
+}
+
+void sys_cursor_visible(int visible) {
+    (void)sys_call1(SYS_CURSOR_VISIBLE, (uintptr_t)visible);
+}
+
+int sys_mouse_state(sys_mouse_state_t* out) {
+    return (int)sys_call1(SYS_MOUSE_STATE, (uintptr_t)out);
+}
+
+void sys_mouse_draw(int visible) {
+    (void)sys_call1(SYS_MOUSE_DRAW, (uintptr_t)visible);
 }

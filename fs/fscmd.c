@@ -7,6 +7,7 @@
 #include "../drivers/ata.h"
 #include "../libc/string.h"
 #include "../kernel/kernel.h"
+#include "../mm/mem.h"
 #include "../drivers/keyboard.h"
 
 fs_type_t current_fs = FS_NONE;
@@ -107,6 +108,64 @@ void fscmd_ls(const char* path) {
     else {
         kprint("No filesystem mounted.\n");
     }
+}
+
+int fscmd_list_dir(const char* path, char* names, uint8_t* is_dir, uint32_t max_entries, size_t name_len) {
+    if (!names || !is_dir || max_entries == 0 || name_len == 0) {
+        return -1;
+    }
+
+    if (current_fs == FS_FAT16) {
+        uint16_t cluster;
+        if (!path || path[0] == '\0') {
+            cluster = current_dir_cluster16;
+        } else {
+            cluster = fat16_resolve_dir(path);
+            if (cluster == 0xFFFF) {
+                return -1;
+            }
+        }
+        return fat16_list_dir_lfn(cluster, names, (bool*)is_dir, (int)max_entries, name_len);
+    }
+
+    if (current_fs == FS_FAT32) {
+        uint32_t cluster;
+        if (!path || path[0] == '\0') {
+            cluster = current_dir_cluster32;
+        } else {
+            cluster = fat32_resolve_dir(path);
+            if (cluster < 2 || cluster >= 0x0FFFFFF8) {
+                return -1;
+            }
+        }
+        return fat32_list_dir_lfn(cluster, names, (bool*)is_dir, (int)max_entries, name_len);
+    }
+
+    if (current_fs == FS_XVFS) {
+        if (max_entries > 256) {
+            max_entries = 256;
+        }
+        XVFS_FileEntry* entries = (XVFS_FileEntry*)kmalloc(max_entries * sizeof(XVFS_FileEntry), 0, NULL);
+        if (!entries) {
+            return -1;
+        }
+        int count = xvfs_read_dir_entries(path, entries, max_entries);
+        if (count < 0) {
+            kfree(entries);
+            return -1;
+        }
+        for (int i = 0; i < count; i++) {
+            char* dest = names + ((size_t)i * name_len);
+            strncpy(dest, entries[i].name, name_len - 1);
+            dest[name_len - 1] = '\0';
+            is_dir[i] = (entries[i].attr & 1u) ? 1u : 0u;
+        }
+        kfree(entries);
+        return count;
+    }
+
+    kprint("No filesystem mounted.\n");
+    return -1;
 }
 
 void fscmd_cat(const char* path) {

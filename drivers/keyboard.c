@@ -591,6 +591,14 @@ int getkey(void) {
     return (int)c;
 }
 
+int getkey_nonblock(void) {
+    uint8_t c = 0;
+    if (!note_keybuf_pop(&c)) {
+        return 0;
+    }
+    return (int)c;
+}
+
 void keyboard_flush(void) {
     hal_disable_interrupts();
     note_keybuf_clear_unsafe();

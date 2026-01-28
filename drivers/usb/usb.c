@@ -97,6 +97,8 @@ enum {
     USB_DESC_CONFIG = 2,
     USB_DESC_INTERFACE = 4,
     USB_DESC_ENDPOINT = 5,
+    USB_DESC_HID = 0x21,
+    USB_DESC_HID_REPORT = 0x22,
     USB_DESC_HUB = 0x29,
 };
 
@@ -126,6 +128,50 @@ enum {
     HID_REQ_SET_IDLE = 0x0A,
     HID_REQ_SET_PROTOCOL = 0x0B,
 };
+
+#define HID_USAGE_PAGE_GENERIC 0x01
+#define HID_USAGE_PAGE_KBD 0x07
+#define HID_USAGE_PAGE_BUTTON 0x09
+#define HID_USAGE_X 0x30
+#define HID_USAGE_Y 0x31
+#define HID_USAGE_WHEEL 0x38
+
+#define HID_REPORT_MAX_TRACKED 4
+
+typedef struct hid_report_info {
+    bool used;
+    uint8_t report_id;
+    uint16_t bit_off;
+    uint16_t report_bits;
+
+    bool has_mods;
+    uint16_t mod_bit_off;
+    uint8_t mod_bit_count;
+
+    bool has_keys;
+    uint16_t keys_bit_off;
+    uint8_t keys_count;
+    uint8_t keys_size;
+
+    bool has_buttons;
+    uint16_t buttons_bit_off;
+    uint8_t buttons_count;
+
+    bool has_x;
+    uint16_t x_bit_off;
+    uint8_t x_size;
+    bool x_rel;
+
+    bool has_y;
+    uint16_t y_bit_off;
+    uint8_t y_size;
+    bool y_rel;
+
+    bool has_wheel;
+    uint16_t wheel_bit_off;
+    uint8_t wheel_size;
+    bool wheel_rel;
+} hid_report_info_t;
 
 enum {
     USB_MSC_SUBCLASS_SCSI = 0x06,
@@ -213,6 +259,9 @@ typedef struct {
     uint16_t intr_in_mps;
     uint8_t intr_in_interval;
 
+    bool report_proto;
+    hid_report_info_t report;
+
     usb_async_in_t in;
     uint8_t buf[64];
     uint16_t buf_len;
@@ -234,11 +283,13 @@ typedef struct {
     uint8_t hid_kbd_ep;
     uint16_t hid_kbd_mps;
     uint8_t hid_kbd_interval;
+    uint16_t hid_kbd_report_len;
 
     uint8_t hid_mouse_iface;
     uint8_t hid_mouse_ep;
     uint16_t hid_mouse_mps;
     uint8_t hid_mouse_interval;
+    uint16_t hid_mouse_report_len;
 
     uint8_t last_iface_class;
     uint8_t last_iface_sub;
@@ -295,6 +346,18 @@ static bool usb_get_desc(usb_hc_t* hc, uint32_t dev, uint8_t ep0_mps,
     return usb_control(hc, dev, ep0_mps, speed, tt_hub_addr, tt_port, &setup, buf, len);
 }
 
+static bool usb_get_report_desc(usb_hc_t* hc, uint32_t dev, uint8_t ep0_mps,
+                                usb_speed_t speed, uint8_t tt_hub_addr, uint8_t tt_port,
+                                uint8_t iface_num, void* buf, uint16_t len) {
+    usb_setup_pkt_t setup;
+    setup.bmRequestType = 0x81;
+    setup.bRequest = USB_REQ_GET_DESCRIPTOR;
+    setup.wValue = (uint16_t)(USB_DESC_HID_REPORT << 8);
+    setup.wIndex = iface_num;
+    setup.wLength = len;
+    return usb_control(hc, dev, ep0_mps, speed, tt_hub_addr, tt_port, &setup, buf, len);
+}
+
 static bool usb_set_configuration(usb_hc_t* hc, uint32_t dev, uint8_t ep0_mps,
                                   usb_speed_t speed, uint8_t tt_hub_addr, uint8_t tt_port,
                                   uint8_t cfg_value) {
@@ -343,10 +406,294 @@ static bool usb_hid_set_idle(usb_hc_t* hc, uint32_t dev, uint8_t ep0_mps,
     return usb_control(hc, dev, ep0_mps, speed, tt_hub_addr, tt_port, &setup, NULL, 0);
 }
 
+#define HID_USAGE_PAGE_GENERIC 0x01
+#define HID_USAGE_PAGE_KBD 0x07
+#define HID_USAGE_PAGE_BUTTON 0x09
+#define HID_USAGE_X 0x30
+#define HID_USAGE_Y 0x31
+#define HID_USAGE_WHEEL 0x38
+
+#define HID_REPORT_MAX_TRACKED 4
+
+typedef struct hid_report_info {
+    bool used;
+    uint8_t report_id;
+    uint16_t bit_off;
+    uint16_t report_bits;
+
+    bool has_mods;
+    uint16_t mod_bit_off;
+    uint8_t mod_bit_count;
+
+    bool has_keys;
+    uint16_t keys_bit_off;
+    uint8_t keys_count;
+    uint8_t keys_size;
+
+    bool has_buttons;
+    uint16_t buttons_bit_off;
+    uint8_t buttons_count;
+
+    bool has_x;
+    uint16_t x_bit_off;
+    uint8_t x_size;
+    bool x_rel;
+
+    bool has_y;
+    uint16_t y_bit_off;
+    uint8_t y_size;
+    bool y_rel;
+
+    bool has_wheel;
+    uint16_t wheel_bit_off;
+    uint8_t wheel_size;
+    bool wheel_rel;
+} hid_report_info_t;
+
+typedef struct {
+    uint16_t usage_page;
+    uint8_t report_size;
+    uint8_t report_count;
+    uint8_t report_id;
+} hid_global_t;
+
+typedef struct {
+    uint16_t usages[16];
+    uint8_t usage_count;
+    uint16_t usage_min;
+    uint16_t usage_max;
+    bool has_usage_minmax;
+} hid_local_t;
+
+static hid_report_info_t* hid_get_report_info(hid_report_info_t* infos, size_t count, uint8_t report_id) {
+    for (size_t i = 0; i < count; i++) {
+        if (infos[i].used && infos[i].report_id == report_id) return &infos[i];
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!infos[i].used) {
+            memset(&infos[i], 0, sizeof(infos[i]));
+            infos[i].used = true;
+            infos[i].report_id = report_id;
+            return &infos[i];
+        }
+    }
+    return NULL;
+}
+
+static void hid_local_reset(hid_local_t* l) {
+    memset(l, 0, sizeof(*l));
+}
+
+static uint16_t hid_local_usage(const hid_local_t* l, uint8_t idx) {
+    if (idx < l->usage_count) return l->usages[idx];
+    if (l->has_usage_minmax && l->usage_min <= l->usage_max) {
+        uint16_t usage = (uint16_t)(l->usage_min + idx);
+        if (usage <= l->usage_max) return usage;
+    }
+    return 0;
+}
+
+static uint32_t hid_get_bits(const uint8_t* buf, uint16_t bit_off, uint8_t bit_len) {
+    uint32_t v = 0;
+    for (uint8_t i = 0; i < bit_len; i++) {
+        uint16_t b = (uint16_t)(bit_off + i);
+        uint8_t byte = buf[b >> 3];
+        uint8_t bit = (uint8_t)((byte >> (b & 7u)) & 1u);
+        v |= ((uint32_t)bit << i);
+    }
+    return v;
+}
+
+static int32_t hid_get_bits_signed(const uint8_t* buf, uint16_t bit_off, uint8_t bit_len) {
+    if (bit_len == 0) return 0;
+    uint32_t v = hid_get_bits(buf, bit_off, bit_len);
+    if (bit_len < 32 && (v & (1u << (bit_len - 1u)))) {
+        v |= ~((1u << bit_len) - 1u);
+    }
+    return (int32_t)v;
+}
+
+static bool hid_parse_report_desc(const uint8_t* desc, uint16_t len, bool is_mouse,
+                                  hid_report_info_t* out) {
+    hid_report_info_t infos[HID_REPORT_MAX_TRACKED];
+    memset(infos, 0, sizeof(infos));
+
+    hid_global_t g;
+    memset(&g, 0, sizeof(g));
+    hid_local_t l;
+    hid_local_reset(&l);
+
+    uint16_t i = 0;
+    while (i < len) {
+        uint8_t b = desc[i++];
+        if (b == 0xFE) {
+            if (i + 1 >= len) break;
+            uint8_t data_size = desc[i];
+            i = (uint16_t)(i + 2 + data_size);
+            continue;
+        }
+        uint8_t size_code = (uint8_t)(b & 0x3u);
+        uint8_t item_size = (size_code == 3) ? 4u : size_code;
+        uint8_t type = (uint8_t)((b >> 2) & 0x3u);
+        uint8_t tag = (uint8_t)((b >> 4) & 0xFu);
+        uint32_t data = 0;
+        for (uint8_t j = 0; j < item_size && i < len; j++) {
+            data |= ((uint32_t)desc[i++] << (8u * j));
+        }
+
+        if (type == 1) {
+            switch (tag) {
+            case 0x0: g.usage_page = (uint16_t)data; break;
+            case 0x7: g.report_size = (uint8_t)data; break;
+            case 0x8: g.report_id = (uint8_t)data; break;
+            case 0x9: g.report_count = (uint8_t)data; break;
+            default: break;
+            }
+        } else if (type == 2) {
+            switch (tag) {
+            case 0x0:
+                if (l.usage_count < (uint8_t)(sizeof(l.usages) / sizeof(l.usages[0]))) {
+                    l.usages[l.usage_count++] = (uint16_t)data;
+                }
+                break;
+            case 0x1: l.usage_min = (uint16_t)data; l.has_usage_minmax = true; break;
+            case 0x2: l.usage_max = (uint16_t)data; l.has_usage_minmax = true; break;
+            default: break;
+            }
+        } else if (type == 0) {
+            if (tag == 0x8) {
+                hid_report_info_t* info = hid_get_report_info(infos, HID_REPORT_MAX_TRACKED, g.report_id);
+                if (!info) {
+                    hid_local_reset(&l);
+                    continue;
+                }
+
+                bool is_const = (data & 0x01u) != 0;
+                bool is_var = (data & 0x02u) != 0;
+                bool is_rel = (data & 0x04u) != 0;
+                uint8_t count = g.report_count;
+                uint8_t size = g.report_size;
+                uint16_t bit_off = info->bit_off;
+
+                if (size != 0 && count != 0) {
+                    if (!is_const) {
+                        for (uint8_t idx = 0; idx < count; idx++) {
+                            uint16_t usage = hid_local_usage(&l, idx);
+                            uint16_t elem_off = (uint16_t)(bit_off + (uint16_t)idx * size);
+                            if (!is_mouse) {
+                                if (g.usage_page == HID_USAGE_PAGE_KBD) {
+                                    if (is_var && size == 1 && usage >= 0xE0 && usage <= 0xE7) {
+                                        if (!info->has_mods) {
+                                            info->has_mods = true;
+                                            info->mod_bit_off = elem_off;
+                                            info->mod_bit_count = (count > 8) ? 8 : count;
+                                        }
+                                    } else if (!is_var && size == 8 && !info->has_keys) {
+                                        info->has_keys = true;
+                                        info->keys_bit_off = bit_off;
+                                        info->keys_count = count;
+                                        info->keys_size = size;
+                                    }
+                                }
+                            } else {
+                                if (g.usage_page == HID_USAGE_PAGE_BUTTON && is_var && size == 1) {
+                                    if (!info->has_buttons) {
+                                        info->has_buttons = true;
+                                        info->buttons_bit_off = elem_off;
+                                        info->buttons_count = count;
+                                    }
+                                } else if (g.usage_page == HID_USAGE_PAGE_GENERIC && is_var) {
+                                    if (usage == HID_USAGE_X && !info->has_x) {
+                                        info->has_x = true;
+                                        info->x_bit_off = elem_off;
+                                        info->x_size = size;
+                                        info->x_rel = is_rel;
+                                    } else if (usage == HID_USAGE_Y && !info->has_y) {
+                                        info->has_y = true;
+                                        info->y_bit_off = elem_off;
+                                        info->y_size = size;
+                                        info->y_rel = is_rel;
+                                    } else if (usage == HID_USAGE_WHEEL && !info->has_wheel) {
+                                        info->has_wheel = true;
+                                        info->wheel_bit_off = elem_off;
+                                        info->wheel_size = size;
+                                        info->wheel_rel = is_rel;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    info->bit_off = (uint16_t)(bit_off + (uint16_t)count * size);
+                    if (info->bit_off > info->report_bits) info->report_bits = info->bit_off;
+                }
+                hid_local_reset(&l);
+            } else {
+                hid_local_reset(&l);
+            }
+        }
+    }
+
+    hid_report_info_t* best = NULL;
+    for (size_t idx = 0; idx < HID_REPORT_MAX_TRACKED; idx++) {
+        hid_report_info_t* info = &infos[idx];
+        if (!info->used) continue;
+        if (!is_mouse) {
+            if (info->has_keys && info->has_mods) { best = info; break; }
+            if (!best && info->has_keys) best = info;
+        } else {
+            if (info->has_x && info->has_y && info->has_buttons) { best = info; break; }
+            if (!best && info->has_x && info->has_y) best = info;
+        }
+    }
+    if (!best) return false;
+    *out = *best;
+    return true;
+}
+
 static void usb_hid_mouse_process(usb_hid_dev_t* dev, uint16_t actual) {
     if (!dev) return;
-    if (actual < 3) return;
+    if (dev->report_proto) {
+        const hid_report_info_t* r = &dev->report;
+        if (!r->has_x || !r->has_y) return;
+        if (r->report_id != 0) {
+            if (actual < 1 || dev->buf[0] != r->report_id) return;
+        }
+        uint16_t base = (r->report_id != 0) ? 8u : 0u;
+        uint16_t max_bits = (uint16_t)(r->x_bit_off + r->x_size);
+        uint16_t y_bits = (uint16_t)(r->y_bit_off + r->y_size);
+        if (y_bits > max_bits) max_bits = y_bits;
+        if (r->has_buttons) {
+            uint16_t b_bits = (uint16_t)(r->buttons_bit_off + r->buttons_count);
+            if (b_bits > max_bits) max_bits = b_bits;
+        }
+        if (r->has_wheel) {
+            uint16_t w_bits = (uint16_t)(r->wheel_bit_off + r->wheel_size);
+            if (w_bits > max_bits) max_bits = w_bits;
+        }
+        if ((uint32_t)base + max_bits > (uint32_t)actual * 8u) return;
+        if (r->x_size > 16 || r->y_size > 16) return;
 
+        int dx = r->x_rel ? hid_get_bits_signed(dev->buf, (uint16_t)(base + r->x_bit_off), r->x_size)
+                          : (int)hid_get_bits(dev->buf, (uint16_t)(base + r->x_bit_off), r->x_size);
+        int dy = r->y_rel ? hid_get_bits_signed(dev->buf, (uint16_t)(base + r->y_bit_off), r->y_size)
+                          : (int)hid_get_bits(dev->buf, (uint16_t)(base + r->y_bit_off), r->y_size);
+        int wheel = 0;
+        if (r->has_wheel && r->wheel_size <= 16) {
+            wheel = r->wheel_rel ? hid_get_bits_signed(dev->buf, (uint16_t)(base + r->wheel_bit_off), r->wheel_size)
+                                 : (int)hid_get_bits(dev->buf, (uint16_t)(base + r->wheel_bit_off), r->wheel_size);
+        }
+
+        int buttons = 0;
+        if (r->has_buttons) {
+            uint8_t bcount = r->buttons_count;
+            if (bcount > 8) bcount = 8;
+            buttons = (int)hid_get_bits(dev->buf, (uint16_t)(base + r->buttons_bit_off), bcount);
+        }
+        mouse_inject(dx, dy, wheel, buttons);
+        return;
+    }
+
+    if (actual < 3) return;
     uint8_t buttons = dev->buf[0];
     int dx = (int8_t)dev->buf[1];
     int dy = (int8_t)dev->buf[2];
@@ -358,7 +705,8 @@ static void usb_hid_mouse_process(usb_hid_dev_t* dev, uint16_t actual) {
 static void usb_hid_attach(usb_hc_t* hc, uint32_t dev_handle, uint8_t ep0_mps,
                            usb_speed_t speed, uint8_t tt_hub_addr, uint8_t tt_port,
                            usb_hid_kind_t kind, uint8_t iface_num,
-                           uint8_t intr_in_ep, uint16_t intr_in_mps, uint8_t intr_in_interval) {
+                           uint8_t intr_in_ep, uint16_t intr_in_mps, uint8_t intr_in_interval,
+                           uint16_t report_len) {
     if (hid_dev_count >= USB_MAX_HID_DEVS) return;
     if (intr_in_ep == 0 || intr_in_mps == 0) return;
 
@@ -383,14 +731,37 @@ static void usb_hid_attach(usb_hc_t* hc, uint32_t dev_handle, uint8_t ep0_mps,
     hid->intr_in_mps = intr_in_mps;
     hid->intr_in_interval = intr_in_interval;
 
-    hid->buf_len = intr_in_mps;
-    if (hid->buf_len < 8) hid->buf_len = 8;
-    if (hid->buf_len > sizeof(hid->buf)) hid->buf_len = sizeof(hid->buf);
+    hid->report_proto = false;
+    memset(&hid->report, 0, sizeof(hid->report));
+
+    if (report_len > 0 && report_len <= 1024) {
+        uint8_t* report_desc = (uint8_t*)kmalloc(report_len, 0, NULL);
+        if (report_desc) {
+            if (usb_get_report_desc(hc, dev_handle, ep0_mps, speed, tt_hub_addr, tt_port,
+                                    iface_num, report_desc, report_len) &&
+                hid_parse_report_desc(report_desc, report_len,
+                                      kind == USB_HID_BOOT_MOUSE, &hid->report)) {
+                uint16_t rpt_bytes = (uint16_t)((hid->report.report_bits + 7u) / 8u);
+                if (hid->report.report_id != 0) rpt_bytes = (uint16_t)(rpt_bytes + 1);
+                if (rpt_bytes > 0 && rpt_bytes <= intr_in_mps && rpt_bytes <= sizeof(hid->buf)) {
+                    hid->report_proto = true;
+                    hid->buf_len = rpt_bytes;
+                }
+            }
+            kfree(report_desc);
+        }
+    }
+
+    if (!hid->report_proto) {
+        hid->buf_len = intr_in_mps;
+        if (hid->buf_len < 8) hid->buf_len = 8;
+        if (hid->buf_len > sizeof(hid->buf)) hid->buf_len = sizeof(hid->buf);
+    }
 
     (void)usb_hid_set_idle(hc, dev_handle, ep0_mps, speed, tt_hub_addr, tt_port,
                            iface_num, 0, 0);
     (void)usb_hid_set_protocol(hc, dev_handle, ep0_mps, speed, tt_hub_addr, tt_port,
-                               iface_num, 0);
+                               iface_num, hid->report_proto ? 1 : 0);
 
     bool ok = hc && hc->ops && hc->ops->async_in_init &&
               hc->ops->async_in_init(hc, &hid->in, dev_handle, intr_in_ep, intr_in_mps,
@@ -839,6 +1210,19 @@ static void usb_parse_config(const uint8_t* cfg, uint16_t total_len, usb_parse_r
                                   ifd->bInterfaceSubClass == USB_HID_SUBCLASS_BOOT &&
                                   ifd->bInterfaceProtocol == USB_HID_PROTO_MOUSE);
             if (in_hid_mouse_iface) out->hid_mouse_iface = ifd->bInterfaceNumber;
+        } else if ((in_hid_kbd_iface || in_hid_mouse_iface) && type == USB_DESC_HID && len >= 9) {
+            uint8_t num_desc = cfg[off + 5];
+            uint16_t desc_off = (uint16_t)(off + 6);
+            for (uint8_t d = 0; d < num_desc; d++) {
+                if (desc_off + 2 >= off + len) break;
+                uint8_t desc_type = cfg[desc_off];
+                uint16_t desc_len = (uint16_t)(cfg[desc_off + 1] | (cfg[desc_off + 2] << 8));
+                if (desc_type == USB_DESC_HID_REPORT) {
+                    if (in_hid_kbd_iface) out->hid_kbd_report_len = desc_len;
+                    if (in_hid_mouse_iface) out->hid_mouse_report_len = desc_len;
+                }
+                desc_off = (uint16_t)(desc_off + 3);
+            }
         } else if (type == USB_DESC_ENDPOINT && len >= sizeof(usb_endpoint_desc_t)) {
             usb_endpoint_desc_t* epd = (usb_endpoint_desc_t*)(cfg + off);
             uint8_t ep_addr = epd->bEndpointAddress;
@@ -1018,14 +1402,16 @@ static void usb_enumerate_default(usb_hc_t* hc, usb_speed_t speed,
                                               parsed.hid_kbd_iface,
                                               parsed.hid_kbd_ep,
                                               parsed.hid_kbd_mps ? parsed.hid_kbd_mps : 8,
-                                              parsed.hid_kbd_interval);
+                                              parsed.hid_kbd_interval,
+                                              parsed.hid_kbd_report_len);
             }
             if (parsed.hid_mouse_ep != 0) {
                 usb_hid_attach(hc, dev_handle, ep0_mps, speed, tt_hub_addr, tt_port,
                                USB_HID_BOOT_MOUSE, parsed.hid_mouse_iface,
                                parsed.hid_mouse_ep,
                                parsed.hid_mouse_mps ? parsed.hid_mouse_mps : 4,
-                               parsed.hid_mouse_interval);
+                               parsed.hid_mouse_interval,
+                               parsed.hid_mouse_report_len);
             }
             if (parsed.hid_kbd_ep == 0 && parsed.hid_mouse_ep == 0) {
                 kprintf("[USB] No bulk endpoints (last iface %02x/%02x/%02x alt=%u)\n",
@@ -1316,14 +1702,17 @@ void usb_poll(void) {
     for (int i = 0; i < hid_dev_count; i++) {
         usb_hid_dev_t* dev = &hid_devs[i];
 
-        uint16_t actual = 0;
         if (!dev->hc || !dev->hc->ops || !dev->hc->ops->async_in_check || !dev->hc->ops->async_in_rearm) continue;
-        int rc = dev->hc->ops->async_in_check(&dev->in, &actual);
-        if (rc == 0) continue;
-        if (rc == 1 && actual > 0) {
-            if (dev->kind == USB_HID_BOOT_MOUSE) usb_hid_mouse_process(dev, actual);
+        for (;;) {
+            uint16_t actual = 0;
+            int rc = dev->hc->ops->async_in_check(&dev->in, &actual);
+            if (rc == 0) break;
+            if (rc < 0) break;
+            if (actual > 0) {
+                if (dev->kind == USB_HID_BOOT_MOUSE) usb_hid_mouse_process(dev, actual);
+            }
+            dev->hc->ops->async_in_rearm(&dev->in);
         }
-        dev->hc->ops->async_in_rearm(&dev->in);
     }
 }
 

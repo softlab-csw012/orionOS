@@ -158,7 +158,7 @@ static void invlpg(uint32_t addr) {
 static void map_mmio(uint32_t base) {
     uint32_t start = base & ~0xFFFu;
     for (uint32_t addr = start; addr < start + 0x1000u; addr += 0x1000u) {
-        map_page(page_directory, addr, addr, PAGE_PRESENT | PAGE_RW | PAGE_PCD | PAGE_PWT);
+        vmm_map_page(addr, addr, PAGE_PRESENT | PAGE_RW | PAGE_PCD | PAGE_PWT);
         invlpg(addr);
     }
 }

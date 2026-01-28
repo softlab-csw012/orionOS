@@ -82,7 +82,11 @@ int parse_escapes(const char* src, char* dst, int maxlen) {
 //====kernel_main====
 void kernel_main(uint32_t magic, uint32_t addr) {
     g_mb_info_addr = addr; 
-
+    if (magic != 0x36D76289) {
+        kprint("Invalid multiboot2 magic number.\n"); // 오류 메시지 출력
+        asm volatile("hlt"); // 시스템 정지
+    }
+    
     gdt_install();
     {
         uint32_t esp;

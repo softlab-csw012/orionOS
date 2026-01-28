@@ -6,6 +6,7 @@
 #include "../../mm/paging.h"
 #include "../../cpu/tss.h"
 #include "../../libc/string.h"
+#include "../../drivers/screen.h"
 
 static process_t proc_table[MAX_PROCS];
 static process_t* current_proc = NULL;
@@ -20,6 +21,7 @@ volatile uint32_t sched_next_esp = 0;
 static volatile uint32_t kill_requested_pid = 0;
 static registers_t* last_irq_regs = NULL;
 static uint32_t foreground_pid = 0;
+static uint32_t last_map_log_pid = 0;
 
 static bool proc_is_runnable(const process_t* p);
 static int proc_find_next(int start);
@@ -31,10 +33,24 @@ void proc_wake_vfork_parent(process_t* child);
 static void sysmgr_watchdog_thread(void);
 #define PROC_STACK_SIZE 16384
 #define PROC_KSTACK_SIZE 65536
+#define USER_STACK_TOP 0xBFF00000u
 #define KERNEL_CS 0x08
 #define KERNEL_DS 0x10
 #define USER_CS   0x1B
 #define USER_DS   0x23
+#define EFLAGS_IF 0x200u
+
+static inline uint32_t irq_save(void) {
+    uint32_t flags = 0;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static inline void irq_restore(uint32_t flags) {
+    if (flags & EFLAGS_IF) {
+        __asm__ volatile("sti" ::: "memory");
+    }
+}
 
 static uint32_t proc_get_current_esp(void) {
     uint32_t esp = 0;
@@ -54,6 +70,46 @@ static bool proc_stack_in_use(const process_t* p, uint32_t esp) {
     return esp >= start && esp < end;
 }
 
+static void proc_log_user_map(const char* tag, const process_t* p) {
+    if (!p || p->is_kernel) {
+        return;
+    }
+    uint32_t phys = 0;
+    bool miss_entry = (p->entry && vmm_virt_to_phys(p->entry, &phys) != 0);
+    bool miss_load = false;
+    bool miss_stack = false;
+    if (p->image_load_base && p->image_load_base != p->entry) {
+        miss_load = (vmm_virt_to_phys(p->image_load_base, &phys) != 0);
+    }
+    if (p->stack_base) {
+        miss_stack = (vmm_virt_to_phys(p->stack_base, &phys) != 0);
+    }
+    if (!miss_entry && !miss_load && !miss_stack) {
+        return;
+    }
+    if (p->pid == last_map_log_pid) {
+        return;
+    }
+    last_map_log_pid = p->pid;
+    kprintf("[SCHED] %s pid=%u cr3=%08x pd=%08x entry=%08x load=%08x stack=%08x\n",
+            tag,
+            p->pid,
+            paging_current_dir_phys(),
+            p->page_dir_phys,
+            p->entry,
+            p->image_load_base,
+            p->stack_base);
+    if (miss_entry) {
+        dump_mapping(p->entry);
+    }
+    if (miss_load) {
+        dump_mapping(p->image_load_base);
+    }
+    if (miss_stack) {
+        dump_mapping(p->stack_base);
+    }
+}
+
 static void proc_cleanup(process_t* p) {
     if (!p) {
         return;
@@ -64,8 +120,8 @@ static void proc_cleanup(process_t* p) {
         sys_close_fds_for_pid(pid);
     }
 
-    if (p->stack_base) {
-        kfree((void*)p->stack_base);
+    if (p->stack_kern_base) {
+        kfree((void*)p->stack_kern_base);
     }
     if (p->kstack_base) {
         kfree((void*)p->kstack_base);
@@ -73,8 +129,15 @@ static void proc_cleanup(process_t* p) {
     if (p->image_base) {
         kfree((void*)p->image_base);
     }
+    if (!p->is_kernel && p->page_dir) {
+        kfree((void*)p->page_dir);
+    }
 
     memset(p, 0, sizeof(*p));
+}
+
+void proc_cleanup_process(process_t* p) {
+    proc_cleanup(p);
 }
 
 void proc_init(void) {
@@ -99,10 +162,21 @@ static const uint8_t user_exit_stub[] = {
     0xEB, 0xFE                    // jmp $
 };
 
+static inline void* proc_stack_ptr(process_t* p, uint32_t user_addr) {
+    if (!p || user_addr < p->stack_base) {
+        return NULL;
+    }
+    return (void*)(p->stack_kern_base + (user_addr - p->stack_base));
+}
+
 static uint32_t setup_user_stack(process_t* p, const char* const* argv, int argc) {
     uint32_t stack_top = p->stack_base + p->stack_size;
     uint32_t stub_addr = (stack_top - 16u) & ~0xFu;
-    memcpy((void*)stub_addr, user_exit_stub, sizeof(user_exit_stub));
+    void* stub_ptr = proc_stack_ptr(p, stub_addr);
+    if (!stub_ptr) {
+        return 0;
+    }
+    memcpy(stub_ptr, user_exit_stub, sizeof(user_exit_stub));
 
     uint32_t sp = stub_addr;
     if (!argv || argc < 0) {
@@ -130,7 +204,13 @@ static uint32_t setup_user_stack(process_t* p, const char* const* argv, int argc
             return 0;
         }
         sp -= (uint32_t)len;
-        memcpy((void*)sp, s, len);
+        void* dst = proc_stack_ptr(p, sp);
+        if (!dst) {
+            if (arg_addrs)
+                kfree(arg_addrs);
+            return 0;
+        }
+        memcpy(dst, s, len);
         arg_addrs[i] = sp;
     }
 
@@ -142,7 +222,12 @@ static uint32_t setup_user_stack(process_t* p, const char* const* argv, int argc
         return 0;
     }
     sp -= argv_bytes;
-    uint32_t* argv_out = (uint32_t*)sp;
+    uint32_t* argv_out = (uint32_t*)proc_stack_ptr(p, sp);
+    if (!argv_out) {
+        if (arg_addrs)
+            kfree(arg_addrs);
+        return 0;
+    }
     for (int i = 0; i < argc; i++) {
         argv_out[i] = arg_addrs[i];
     }
@@ -154,7 +239,12 @@ static uint32_t setup_user_stack(process_t* p, const char* const* argv, int argc
         return 0;
     }
     sp -= 8u;
-    uint32_t* header = (uint32_t*)sp;
+    uint32_t* header = (uint32_t*)proc_stack_ptr(p, sp);
+    if (!header) {
+        if (arg_addrs)
+            kfree(arg_addrs);
+        return 0;
+    }
     header[0] = (uint32_t)argc;
     header[1] = (uint32_t)argv_out;
 
@@ -198,9 +288,42 @@ static bool build_kernel_frame(process_t* p, uint32_t entry) {
     return true;
 }
 
+static bool proc_map_user_stack(process_t* p) {
+    if (!p || !p->stack_base || !p->stack_kern_base || p->stack_size == 0) {
+        return false;
+    }
+    uint32_t base = p->stack_base;
+    for (uint32_t offset = 0; offset < p->stack_size; offset += PAGE_SIZE) {
+        uint32_t phys = 0;
+        if (vmm_virt_to_phys(p->stack_kern_base + offset, &phys) != 0) {
+            return false;
+        }
+        vmm_map_page(base + offset, phys, PAGE_PRESENT | PAGE_RW | PAGE_USER);
+    }
+    return true;
+}
+
+static bool proc_init_user_stack(process_t* p) {
+    if (!p) {
+        return false;
+    }
+    p->stack_base = USER_STACK_TOP - p->stack_size;
+    p->stack_kern_base = (uint32_t)kmalloc(p->stack_size, PAGE_SIZE, NULL);
+    if (!p->stack_kern_base) {
+        return false;
+    }
+    memset((void*)p->stack_kern_base, 0, p->stack_size);
+    if (!proc_map_user_stack(p)) {
+        kfree((void*)p->stack_kern_base);
+        p->stack_kern_base = 0;
+        return false;
+    }
+    return true;
+}
+
 static process_t* proc_create_common(const char* name, uint32_t entry,
                                      const char* const* argv, int argc,
-                                     bool make_current) {
+                                     bool make_current, bool build_frame) {
     for (int i = 0; i < MAX_PROCS; i++) {
         if (proc_table[i].state == PROC_UNUSED || proc_table[i].state == PROC_EXITED) {
             process_t* p = &proc_table[i];
@@ -208,37 +331,59 @@ static process_t* proc_create_common(const char* name, uint32_t entry,
             p->is_kernel = false;
             p->pid = next_pid++;
             p->entry = entry;
+            p->image_load_base = 0;
+            p->page_dir = (uint32_t)paging_create_user_dir(&p->page_dir_phys);
+            if (!p->page_dir) {
+                p->state = PROC_UNUSED;
+                return NULL;
+            }
             p->kstack_size = PROC_KSTACK_SIZE;
             p->kstack_base = (uint32_t)kmalloc(p->kstack_size, 1, NULL);
             if (!p->kstack_base) {
+                kfree((void*)p->page_dir);
+                p->page_dir = 0;
+                p->page_dir_phys = 0;
                 p->state = PROC_UNUSED;
                 return NULL;
             }
             p->stack_size = PROC_STACK_SIZE;
-            p->stack_base = (uint32_t)kmalloc(p->stack_size, 1, NULL);
-            if (!p->stack_base) {
+            p->stack_base = 0;
+            p->stack_kern_base = 0;
+            uint32_t irq_flags = irq_save();
+            uint32_t* prev_dir = paging_current_dir();
+            uint32_t prev_phys = paging_current_dir_phys();
+            paging_set_current_dir((uint32_t*)p->page_dir, p->page_dir_phys);
+            if (!proc_init_user_stack(p)) {
+                paging_set_current_dir(prev_dir, prev_phys);
+                irq_restore(irq_flags);
                 kfree((void*)p->kstack_base);
+                kfree((void*)p->page_dir);
                 p->kstack_base = 0;
+                p->page_dir = 0;
+                p->page_dir_phys = 0;
                 p->state = PROC_UNUSED;
                 return NULL;
             }
-            memset((void*)p->stack_base, 0, p->stack_size);
-            if (vmm_mark_user_range(p->stack_base, p->stack_size) != 0) {
-                kfree((void*)p->stack_base);
-                kfree((void*)p->kstack_base);
-                p->stack_base = 0;
-                p->kstack_base = 0;
-                p->state = PROC_UNUSED;
-                return NULL;
+            if (build_frame) {
+                if (!build_initial_frame(p, entry, argv, argc)) {
+                    paging_set_current_dir(prev_dir, prev_phys);
+                    irq_restore(irq_flags);
+                    kfree((void*)p->stack_kern_base);
+                    kfree((void*)p->kstack_base);
+                    kfree((void*)p->page_dir);
+                    p->stack_base = 0;
+                    p->stack_kern_base = 0;
+                    p->kstack_base = 0;
+                    p->page_dir = 0;
+                    p->page_dir_phys = 0;
+                    p->state = PROC_UNUSED;
+                    return NULL;
+                }
+            } else {
+                p->context_esp = 0;
             }
-            if (!build_initial_frame(p, entry, argv, argc)) {
-                kfree((void*)p->stack_base);
-                kfree((void*)p->kstack_base);
-                p->stack_base = 0;
-                p->kstack_base = 0;
-                p->state = PROC_UNUSED;
-                return NULL;
-            }
+            paging_set_current_dir(prev_dir, prev_phys);
+            irq_restore(irq_flags);
             p->state = PROC_READY;
             if (make_current && !current_proc) {
                 p->state = PROC_RUNNING;
@@ -264,6 +409,9 @@ static process_t* proc_create_kernel_common(const char* name, uint32_t entry,
             p->is_kernel = true;
             p->pid = next_pid++;
             p->entry = entry;
+            p->image_load_base = 0;
+            p->page_dir = (uint32_t)paging_kernel_dir();
+            p->page_dir_phys = paging_kernel_dir_phys();
             p->kstack_size = PROC_KSTACK_SIZE;
             p->kstack_base = (uint32_t)kmalloc(p->kstack_size, 1, NULL);
             if (!p->kstack_base) {
@@ -272,6 +420,7 @@ static process_t* proc_create_kernel_common(const char* name, uint32_t entry,
             }
             p->stack_base = 0;
             p->stack_size = 0;
+            p->stack_kern_base = 0;
             if (!build_kernel_frame(p, entry)) {
                 kfree((void*)p->kstack_base);
                 p->kstack_base = 0;
@@ -295,25 +444,40 @@ static process_t* proc_create_kernel_common(const char* name, uint32_t entry,
 }
 
 process_t* proc_create(const char* name, uint32_t entry) {
-    return proc_create_common(name, entry, NULL, 0, true);
+    return proc_create_common(name, entry, NULL, 0, true, true);
 }
 
 process_t* proc_create_with_args(const char* name, uint32_t entry,
                                  const char* const* argv, int argc) {
-    return proc_create_common(name, entry, argv, argc, true);
+    return proc_create_common(name, entry, argv, argc, true, true);
 }
 
 process_t* proc_spawn(const char* name, uint32_t entry) {
-    return proc_create_common(name, entry, NULL, 0, false);
+    return proc_create_common(name, entry, NULL, 0, false, true);
 }
 
 process_t* proc_spawn_with_args(const char* name, uint32_t entry,
                                 const char* const* argv, int argc) {
-    return proc_create_common(name, entry, argv, argc, false);
+    return proc_create_common(name, entry, argv, argc, false, true);
 }
 
 process_t* proc_spawn_kernel(const char* name, uint32_t entry) {
     return proc_create_kernel_common(name, entry, false);
+}
+
+process_t* proc_create_pending(const char* name, bool make_current) {
+    return proc_create_common(name, 0, NULL, 0, make_current, false);
+}
+
+bool proc_build_user_frame(process_t* p, uint32_t entry, const char* const* argv, int argc) {
+    if (!p || p->is_kernel) {
+        return false;
+    }
+    p->entry = entry;
+    if (!build_initial_frame(p, entry, argv, argc)) {
+        return false;
+    }
+    return true;
 }
 
 void proc_exit(uint32_t exit_code) {
@@ -376,6 +540,22 @@ bool proc_pid_alive(uint32_t pid) {
         return proc_table[i].state != PROC_UNUSED && proc_table[i].state != PROC_EXITED;
     }
     return false;
+}
+
+process_t* proc_lookup(uint32_t pid) {
+    if (pid == 0) {
+        return NULL;
+    }
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (proc_table[i].pid != pid) {
+            continue;
+        }
+        if (proc_table[i].state == PROC_UNUSED || proc_table[i].state == PROC_EXITED) {
+            return NULL;
+        }
+        return &proc_table[i];
+    }
+    return NULL;
 }
 
 bool proc_pid_exited(uint32_t pid, uint32_t* exit_code) {
@@ -475,7 +655,13 @@ process_t* proc_fork(registers_t* regs) {
     child->pid = next_pid++;
     child->entry = current_proc->entry;
     child->image_base = 0;
-    child->image_size = 0;
+    child->image_size = current_proc->image_size;
+    child->image_load_base = current_proc->image_load_base;
+    child->page_dir = (uint32_t)paging_create_user_dir(&child->page_dir_phys);
+    if (!child->page_dir) {
+        child->state = PROC_UNUSED;
+        return NULL;
+    }
     child->vfork_parent_pid = current_proc->pid;
 
     child->kstack_size = PROC_KSTACK_SIZE;
@@ -494,22 +680,63 @@ process_t* proc_fork(registers_t* regs) {
     child->stack_size = 0;
     if (current_proc->stack_base && current_proc->stack_size) {
         child->stack_size = current_proc->stack_size;
-        child->stack_base = (uint32_t)kmalloc(child->stack_size, 1, NULL);
-        if (!child->stack_base) {
+        child->stack_base = 0;
+        child->stack_kern_base = 0;
+        if (child->image_size && child->image_load_base && current_proc->image_base) {
+            child->image_base = (uint32_t)kmalloc(child->image_size, 1, NULL);
+            if (!child->image_base) {
+                kfree((void*)child->kstack_base);
+                child->kstack_base = 0;
+                kfree((void*)child->page_dir);
+                child->page_dir = 0;
+                child->page_dir_phys = 0;
+                child->state = PROC_UNUSED;
+                return NULL;
+            }
+            memcpy((void*)child->image_base, (void*)current_proc->image_base, child->image_size);
+        }
+
+        uint32_t irq_flags = irq_save();
+        uint32_t* prev_dir = paging_current_dir();
+        uint32_t prev_phys = paging_current_dir_phys();
+        paging_set_current_dir((uint32_t*)child->page_dir, child->page_dir_phys);
+        if (child->image_base && child->image_size && child->image_load_base) {
+            for (uint32_t offset = 0; offset < child->image_size; offset += PAGE_SIZE) {
+                uint32_t phys = 0;
+                if (vmm_virt_to_phys(child->image_base + offset, &phys) != 0) {
+                    paging_set_current_dir(prev_dir, prev_phys);
+                    irq_restore(irq_flags);
+                    kfree((void*)child->image_base);
+                    kfree((void*)child->kstack_base);
+                    kfree((void*)child->page_dir);
+                    child->image_base = 0;
+                    child->kstack_base = 0;
+                    child->page_dir = 0;
+                    child->page_dir_phys = 0;
+                    child->state = PROC_UNUSED;
+                    return NULL;
+                }
+                vmm_map_page(child->image_load_base + offset, phys,
+                             PAGE_PRESENT | PAGE_RW | PAGE_USER);
+            }
+        }
+        if (!proc_init_user_stack(child)) {
+            paging_set_current_dir(prev_dir, prev_phys);
+            irq_restore(irq_flags);
+            kfree((void*)child->image_base);
             kfree((void*)child->kstack_base);
+            kfree((void*)child->page_dir);
+            child->image_base = 0;
             child->kstack_base = 0;
+            child->page_dir = 0;
+            child->page_dir_phys = 0;
             child->state = PROC_UNUSED;
             return NULL;
         }
-        memcpy((void*)child->stack_base, (void*)current_proc->stack_base, child->stack_size);
-        if (vmm_mark_user_range(child->stack_base, child->stack_size) != 0) {
-            kfree((void*)child->stack_base);
-            kfree((void*)child->kstack_base);
-            child->stack_base = 0;
-            child->kstack_base = 0;
-            child->state = PROC_UNUSED;
-            return NULL;
-        }
+        paging_set_current_dir(prev_dir, prev_phys);
+        irq_restore(irq_flags);
+        memcpy((void*)child->stack_kern_base, (void*)current_proc->stack_kern_base,
+               child->stack_size);
         uint32_t parent_stack_base = current_proc->stack_base;
         uint32_t parent_stack_end = parent_stack_base + current_proc->stack_size;
         if (parent_stack_end >= parent_stack_base &&
@@ -537,48 +764,59 @@ process_t* proc_fork(registers_t* regs) {
 }
 
 bool proc_exec(process_t* p, uint32_t entry, uint32_t image_base, uint32_t image_size,
-               const char* const* argv, int argc) {
+               uint32_t image_load_base, const char* const* argv, int argc) {
     if (!p || p->is_kernel) {
         return false;
     }
 
     uint32_t old_stack_base = p->stack_base;
     uint32_t old_stack_size = p->stack_size;
+    uint32_t old_stack_kern = p->stack_kern_base;
     uint32_t old_image_base = p->image_base;
     uint32_t old_image_size = p->image_size;
+    uint32_t old_image_load = p->image_load_base;
     uint32_t old_entry = p->entry;
 
     p->stack_size = PROC_STACK_SIZE;
-    p->stack_base = (uint32_t)kmalloc(p->stack_size, 1, NULL);
-    if (!p->stack_base) {
+    p->stack_base = 0;
+    p->stack_kern_base = 0;
+
+    uint32_t irq_flags = irq_save();
+    uint32_t* prev_dir = paging_current_dir();
+    uint32_t prev_phys = paging_current_dir_phys();
+    paging_set_current_dir((uint32_t*)p->page_dir, p->page_dir_phys);
+    if (!proc_init_user_stack(p)) {
+        paging_set_current_dir(prev_dir, prev_phys);
+        irq_restore(irq_flags);
         p->stack_base = old_stack_base;
         p->stack_size = old_stack_size;
-        return false;
-    }
-    memset((void*)p->stack_base, 0, p->stack_size);
-    if (vmm_mark_user_range(p->stack_base, p->stack_size) != 0) {
-        kfree((void*)p->stack_base);
-        p->stack_base = old_stack_base;
-        p->stack_size = old_stack_size;
+        p->stack_kern_base = old_stack_kern;
         return false;
     }
 
     p->entry = entry;
     p->image_base = image_base;
     p->image_size = image_size;
+    p->image_load_base = image_load_base;
 
     if (!build_initial_frame(p, entry, argv, argc)) {
-        kfree((void*)p->stack_base);
+        paging_set_current_dir(prev_dir, prev_phys);
+        irq_restore(irq_flags);
+        kfree((void*)p->stack_kern_base);
         p->stack_base = old_stack_base;
         p->stack_size = old_stack_size;
+        p->stack_kern_base = old_stack_kern;
         p->image_base = old_image_base;
         p->image_size = old_image_size;
+        p->image_load_base = old_image_load;
         p->entry = old_entry;
         return false;
     }
+    paging_set_current_dir(prev_dir, prev_phys);
+    irq_restore(irq_flags);
 
-    if (old_stack_base) {
-        kfree((void*)old_stack_base);
+    if (old_stack_kern) {
+        kfree((void*)old_stack_kern);
     }
     if (old_image_base) {
         kfree((void*)old_image_base);
@@ -611,6 +849,10 @@ bool proc_make_current(process_t* p, registers_t* regs) {
             current_index = idx;
         }
         tss_set_kernel_stack(current_proc->kstack_base + current_proc->kstack_size);
+        if (current_proc->page_dir) {
+            paging_set_current_dir((uint32_t*)current_proc->page_dir, current_proc->page_dir_phys);
+            proc_log_user_map("make-current", current_proc);
+        }
         return true;
     }
     if (current_proc && !regs) {
@@ -635,6 +877,10 @@ bool proc_make_current(process_t* p, registers_t* regs) {
     current_proc = p;
     current_proc->state = PROC_RUNNING;
     tss_set_kernel_stack(current_proc->kstack_base + current_proc->kstack_size);
+    if (current_proc->page_dir) {
+        paging_set_current_dir((uint32_t*)current_proc->page_dir, current_proc->page_dir_phys);
+        proc_log_user_map("make-current", current_proc);
+    }
     return true;
 }
 
@@ -715,9 +961,14 @@ proc_kill_result_t proc_kill(uint32_t pid, bool force) {
         if (proc_table[i].is_kernel && !force) {
             return PROC_KILL_KERNEL;
         }
+        bool was_foreground = proc_is_foreground_pid(pid);
         proc_table[i].exit_code = 0;
         proc_table[i].state = PROC_EXITED;
         proc_wake_vfork_parent(&proc_table[i]);
+        if (was_foreground) {
+            foreground_pid = 0;
+            bin_return_to_shell();
+        }
         if (proc_reaper_enabled) {
             proc_reap_pending = true;
         }
@@ -825,6 +1076,10 @@ bool proc_schedule(registers_t* regs, bool save_current) {
     current_proc = &proc_table[next];
     current_proc->state = PROC_RUNNING;
     tss_set_kernel_stack(current_proc->kstack_base + current_proc->kstack_size);
+    if (current_proc->page_dir) {
+        paging_set_current_dir((uint32_t*)current_proc->page_dir, current_proc->page_dir_phys);
+        proc_log_user_map("schedule", current_proc);
+    }
     sched_next_esp = current_proc->context_esp;
     return true;
 }

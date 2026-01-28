@@ -325,6 +325,156 @@ bool screen_is_framebuffer(void) {
     return g_fb.enabled;
 }
 
+bool screen_get_framebuffer_info(screen_fb_info_t* out) {
+    if (!out || !g_fb.enabled)
+        return false;
+
+    out->width = g_fb.width;
+    out->height = g_fb.height;
+    out->pitch = g_fb.pitch;
+    out->bpp = g_fb.bpp;
+    out->bytes_per_pixel = g_fb.bytes_per_pixel;
+    out->font_w = font_get_width();
+    out->font_h = font_get_height();
+    return true;
+}
+
+static inline bool fb_write_ready(void) {
+    if (!g_fb.enabled)
+        return false;
+    return g_fb.bytes_per_pixel == 3 || g_fb.bytes_per_pixel == 4;
+}
+
+static inline void fb_write_color(uint8_t* dst, uint32_t color) {
+    dst[0] = (uint8_t)(color & 0xff);
+    dst[1] = (uint8_t)((color >> 8) & 0xff);
+    dst[2] = (uint8_t)((color >> 16) & 0xff);
+    if (g_fb.bytes_per_pixel == 4)
+        dst[3] = 0;
+}
+
+bool screen_fb_get_pixel(int x, int y, uint32_t* out) {
+    if (!fb_write_ready() || !out)
+        return false;
+    if (x < 0 || y < 0 || x >= (int)g_fb.width || y >= (int)g_fb.height)
+        return false;
+    uint8_t* src = g_fb.addr + (uint32_t)y * g_fb.pitch + (uint32_t)x * g_fb.bytes_per_pixel;
+    *out = (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16);
+    return true;
+}
+
+void screen_fb_set_pixel(int x, int y, uint32_t color) {
+    if (!fb_write_ready())
+        return;
+    if (x < 0 || y < 0 || x >= (int)g_fb.width || y >= (int)g_fb.height)
+        return;
+    uint8_t* dst = g_fb.addr + (uint32_t)y * g_fb.pitch + (uint32_t)x * g_fb.bytes_per_pixel;
+    fb_write_color(dst, color);
+}
+
+void screen_fb_fill_rect(int x, int y, int w, int h, uint32_t color) {
+    if (!fb_write_ready())
+        return;
+    if (w <= 0 || h <= 0)
+        return;
+
+    int x0 = x;
+    int y0 = y;
+    int x1 = x + w;
+    int y1 = y + h;
+
+    int max_w = (int)g_fb.width;
+    int max_h = (int)g_fb.height;
+    if (x1 <= 0 || y1 <= 0 || x0 >= max_w || y0 >= max_h)
+        return;
+
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > max_w) x1 = max_w;
+    if (y1 > max_h) y1 = max_h;
+    if (x0 >= x1 || y0 >= y1)
+        return;
+
+    uint32_t bpp = g_fb.bytes_per_pixel;
+    for (int py = y0; py < y1; py++) {
+        uint8_t* dst = g_fb.addr + (uint32_t)py * g_fb.pitch + (uint32_t)x0 * bpp;
+        for (int px = x0; px < x1; px++) {
+            fb_write_color(dst, color);
+            dst += bpp;
+        }
+    }
+}
+
+static void fb_draw_glyph_px(int x, int y, uint8_t ch, uint32_t fg, uint32_t bg, bool transparent) {
+    if (!fb_write_ready())
+        return;
+
+    uint8_t font_w = font_get_width();
+    uint8_t font_h = font_get_height();
+    uint8_t row_bytes = font_get_row_bytes();
+    if (!font_w || !font_h || !row_bytes)
+        return;
+
+    const uint8_t* glyph = font_get_glyph(ch);
+    int max_w = (int)g_fb.width;
+    int max_h = (int)g_fb.height;
+
+    for (uint8_t gy = 0; gy < font_h; gy++) {
+        int py = y + (int)gy;
+        if (py < 0 || py >= max_h)
+            continue;
+        const uint8_t* row_ptr = glyph + (size_t)gy * row_bytes;
+        for (uint8_t gx = 0; gx < font_w; gx++) {
+            int px = x + (int)gx;
+            if (px < 0 || px >= max_w)
+                continue;
+            uint8_t byte = row_ptr[gx >> 3];
+            uint8_t bit = (uint8_t)(0x80u >> (gx & 7));
+            if (byte & bit) {
+                uint8_t* dst = g_fb.addr + (uint32_t)py * g_fb.pitch +
+                               (uint32_t)px * g_fb.bytes_per_pixel;
+                fb_write_color(dst, fg);
+            } else if (!transparent) {
+                uint8_t* dst = g_fb.addr + (uint32_t)py * g_fb.pitch +
+                               (uint32_t)px * g_fb.bytes_per_pixel;
+                fb_write_color(dst, bg);
+            }
+        }
+    }
+}
+
+void screen_fb_draw_text(int x, int y, const char* text, uint32_t fg, uint32_t bg, bool transparent) {
+    if (!fb_write_ready() || !text)
+        return;
+
+    uint8_t font_w = font_get_width();
+    uint8_t font_h = font_get_height();
+    if (!font_w || !font_h)
+        return;
+
+    int start_x = x;
+    int cx = x;
+    int cy = y;
+    for (const char* p = text; *p; p++) {
+        char ch = *p;
+        if (ch == '\n') {
+            cy += font_h;
+            cx = start_x;
+            continue;
+        }
+        if (ch == '\r') {
+            cx = start_x;
+            continue;
+        }
+        if (ch == '\t') {
+            cx += (int)font_w * 4;
+            continue;
+        }
+        fb_draw_glyph_px(cx, cy, (uint8_t)ch, fg, bg, transparent);
+        cx += font_w;
+    }
+}
+
 int screen_get_cols(void) {
     return screen_cols;
 }

@@ -15,6 +15,7 @@ void mouse_wait(uint8_t type);
 void mouse_write(uint8_t data);
 uint8_t mouse_read(void);
 void mouse_set_ignore_ps2(bool ignore);
+void mouse_set_draw(bool enable);
 
 // Inject a relative mouse movement (dx,dy) and optional wheel/buttons.
 void mouse_inject(int dx, int dy, int wheel, int buttons);

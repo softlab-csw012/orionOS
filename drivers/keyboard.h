@@ -24,6 +24,7 @@ void reset_modifiers(void);
 void init_keyboard();
 void wait_for_keypress();
 int getkey(void);
+int getkey_nonblock(void);
 void keyboard_flush(void);
 void keyboard_note_debounce(void);
 

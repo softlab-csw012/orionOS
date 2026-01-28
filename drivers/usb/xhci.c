@@ -13,6 +13,8 @@
 #define XHCI_MAX_CONTROLLERS 2
 #define XHCI_MAX_SLOTS 32
 #define XHCI_MAX_DCI 32
+// Keep multiple interrupt IN TRBs queued between timer polls.
+#define XHCI_ASYNC_DEPTH 16
 
 typedef struct {
     uint32_t param_lo;
@@ -38,17 +40,33 @@ typedef struct {
 
 typedef struct xhci_ctrl xhci_ctrl_t;
 
+typedef struct {
+    uint8_t* buf;
+    uint32_t buf_phys;
+    uint64_t trb_phys;
+    uint16_t actual;
+    bool in_flight;
+} xhci_async_slot_t;
+
 typedef struct xhci_async {
     xhci_ctrl_t* ctrl;
     uint8_t slot_id;
     uint8_t dci;
-    uint64_t expected_trb;
-    uint32_t buf_phys;
+    void* user_buf;
     uint16_t requested_len;
     uint16_t actual;
     int status; // 0=pending, 1=ok, -1=err
+    xhci_async_slot_t slots[XHCI_ASYNC_DEPTH];
+    uint8_t ready_q[XHCI_ASYNC_DEPTH];
+    uint8_t ready_head;
+    uint8_t ready_tail;
+    uint8_t ready_count;
+    int8_t last_slot;
     struct xhci_async* next;
 } xhci_async_t;
+
+static void xhci_async_free(xhci_async_t* a);
+static bool xhci_async_queue_slot(xhci_async_t* a, xhci_async_slot_t* slot);
 
 typedef struct {
     bool used;
@@ -173,7 +191,7 @@ static void map_mmio(uint32_t base, uint32_t size) {
     uint32_t start = base & ~0xFFFu;
     uint32_t end = (base + size + 0xFFFu) & ~0xFFFu;
     for (uint32_t addr = start; addr < end; addr += 0x1000u) {
-        map_page(page_directory, addr, addr, PAGE_PRESENT | PAGE_RW | PAGE_PCD | PAGE_PWT);
+        vmm_map_page(addr, addr, PAGE_PRESENT | PAGE_RW | PAGE_PCD | PAGE_PWT);
         invlpg(addr);
     }
 }
@@ -407,13 +425,33 @@ static void xhci_handle_transfer_event(xhci_ctrl_t* x, const xhci_trb_t* ev) {
     }
 
     for (xhci_async_t* a = x->async_list; a; a = a->next) {
-        if (a->expected_trb == ptr) {
-            a->status = (cc == CC_SUCCESS || cc == CC_SHORT_PACKET) ? 1 : -1;
+        if (a->slot_id != slot_id) continue;
+        for (int i = 0; i < XHCI_ASYNC_DEPTH; i++) {
+            xhci_async_slot_t* slot = &a->slots[i];
+            if (!slot->in_flight || slot->trb_phys != ptr) continue;
+
+            slot->in_flight = false;
+            if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) {
+                a->status = -1;
+                return;
+            }
+
             uint32_t req = a->requested_len;
+            uint16_t act = 0;
             if (remaining <= req) {
-                uint32_t act = req - remaining;
-                if (act > 0xFFFFu) act = 0xFFFFu;
-                a->actual = (uint16_t)act;
+                uint32_t tmp = req - remaining;
+                if (tmp > 0xFFFFu) tmp = 0xFFFFu;
+                act = (uint16_t)tmp;
+            }
+            slot->actual = act;
+
+            if (a->ready_count < XHCI_ASYNC_DEPTH) {
+                a->ready_q[a->ready_tail] = (uint8_t)i;
+                a->ready_tail = (uint8_t)((a->ready_tail + 1) % XHCI_ASYNC_DEPTH);
+                a->ready_count++;
+            } else {
+                // Drop the report if we're backlogged, but keep the endpoint armed.
+                if (!xhci_async_queue_slot(a, slot)) a->status = -1;
             }
             return;
         }
@@ -603,6 +641,38 @@ static int xhci_find_slot_by_port(xhci_ctrl_t* x, uint8_t root_port) {
     return 0;
 }
 
+static void xhci_async_free(xhci_async_t* a) {
+    if (!a) return;
+    for (int i = 0; i < XHCI_ASYNC_DEPTH; i++) {
+        if (a->slots[i].buf) kfree(a->slots[i].buf);
+    }
+    kfree(a);
+}
+
+static bool xhci_async_queue_slot(xhci_async_t* a, xhci_async_slot_t* slot) {
+    if (!a || !slot || !a->ctrl) return false;
+    if (a->slot_id == 0 || a->slot_id > a->ctrl->max_slots) return false;
+    xhci_dev_t* d = &a->ctrl->devs[a->slot_id];
+    if (!d->used) return false;
+    xhci_ring_t* ring = &d->ep_rings[a->dci];
+    if (!ring->trbs) return false;
+
+    xhci_trb_t trb;
+    memset(&trb, 0, sizeof(trb));
+    trb.param_lo = slot->buf_phys;
+    trb.param_hi = 0;
+    trb.status = a->requested_len;
+    trb.control = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT);
+
+    uint64_t trb_phys = ring_enqueue_trb(ring, &trb, true, false);
+    if (!trb_phys) return false;
+
+    slot->trb_phys = trb_phys;
+    slot->in_flight = true;
+    a->ctrl->db[d->slot_id] = a->dci;
+    return true;
+}
+
 static void xhci_async_cancel_slot(xhci_ctrl_t* x, uint8_t slot_id) {
     if (!x) return;
     xhci_async_t** pp = &x->async_list;
@@ -611,6 +681,7 @@ static void xhci_async_cancel_slot(xhci_ctrl_t* x, uint8_t slot_id) {
         if (cur->slot_id == slot_id) {
             cur->status = -1;
             *pp = cur->next;
+            xhci_async_free(cur);
             continue;
         }
         pp = &(*pp)->next;
@@ -907,26 +978,39 @@ static bool xhci_usbhc_async_in_init(usb_hc_t* hc, usb_async_in_t* x,
     a->ctrl = ctrl;
     a->slot_id = d->slot_id;
     a->dci = dci;
+    a->user_buf = buf;
     a->status = 0;
-    a->buf_phys = phys_addr32(buf);
     a->requested_len = len;
     a->actual = 0;
+    a->last_slot = -1;
 
-    // queue one normal TRB (IOC)
-    xhci_trb_t trb;
-    memset(&trb, 0, sizeof(trb));
-    trb.param_lo = a->buf_phys;
-    trb.param_hi = 0;
-    trb.status = len;
-    trb.control = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT);
-    a->expected_trb = ring_enqueue_trb(ring, &trb, true, false);
-    if (!a->expected_trb) return false;
+    if (!buf || len == 0) {
+        kfree(a);
+        return false;
+    }
 
-    // insert into async list
+    for (int i = 0; i < XHCI_ASYNC_DEPTH; i++) {
+        a->slots[i].buf = (uint8_t*)kmalloc(len, 0, NULL);
+        if (!a->slots[i].buf) {
+            xhci_async_free(a);
+            return false;
+        }
+        a->slots[i].buf_phys = phys_addr32(a->slots[i].buf);
+        a->slots[i].in_flight = false;
+    }
+
+    // insert into async list before ringing the doorbell
     a->next = ctrl->async_list;
     ctrl->async_list = a;
 
-    ctrl->db[d->slot_id] = dci;
+    for (int i = 0; i < XHCI_ASYNC_DEPTH; i++) {
+        if (!xhci_async_queue_slot(a, &a->slots[i])) {
+            ctrl->async_list = a->next;
+            xhci_async_free(a);
+            return false;
+        }
+    }
+
     x->hc = hc;
     x->impl = a;
     return true;
@@ -936,38 +1020,48 @@ static int xhci_usbhc_async_in_check(usb_async_in_t* x, uint16_t* out_actual) {
     if (!x || !x->impl) return -1;
     xhci_async_t* a = (xhci_async_t*)x->impl;
     xhci_poll_events(a->ctrl);
-    if (a->status == 0) return 0;
     if (a->status < 0) return -1;
-    if (out_actual) *out_actual = a->actual;
+    if (a->status == 1) {
+        if (out_actual) *out_actual = a->actual;
+        return 1;
+    }
+    if (a->ready_count == 0) return 0;
+
+    uint8_t idx = a->ready_q[a->ready_head];
+    a->ready_head = (uint8_t)((a->ready_head + 1) % XHCI_ASYNC_DEPTH);
+    a->ready_count--;
+
+    xhci_async_slot_t* slot = &a->slots[idx];
+    uint16_t actual = slot->actual;
+    if (actual > a->requested_len) actual = a->requested_len;
+    if (a->user_buf && slot->buf && actual) memcpy(a->user_buf, slot->buf, actual);
+
+    a->actual = actual;
+    a->status = 1;
+    a->last_slot = (int8_t)idx;
+    if (out_actual) *out_actual = actual;
     return 1;
 }
 
 static void xhci_usbhc_async_in_rearm(usb_async_in_t* x) {
     if (!x || !x->impl) return;
     xhci_async_t* a = (xhci_async_t*)x->impl;
-    xhci_ctrl_t* ctrl = a->ctrl;
-    xhci_dev_t* d = &ctrl->devs[a->slot_id];
-    if (!d->used) return;
-    xhci_ring_t* ring = &d->ep_rings[a->dci];
-    if (!ring->trbs) return;
+    if (a->status < 0) return;
+    if (a->status == 0) return;
+    if (a->last_slot < 0 || a->last_slot >= XHCI_ASYNC_DEPTH) {
+        a->status = 0;
+        return;
+    }
 
-    // Re-queue a fresh IN transfer to the same buffer address as last time.
+    xhci_async_slot_t* slot = &a->slots[a->last_slot];
+    a->last_slot = -1;
     a->status = 0;
     a->actual = 0;
 
-    xhci_trb_t trb;
-    memset(&trb, 0, sizeof(trb));
-    trb.param_lo = a->buf_phys;
-    trb.param_hi = 0;
-    trb.status = a->requested_len;
-    trb.control = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT);
-
-    a->expected_trb = ring_enqueue_trb(ring, &trb, true, false);
-    if (!a->expected_trb) {
+    if (!xhci_async_queue_slot(a, slot)) {
         a->status = -1;
         return;
     }
-    ctrl->db[d->slot_id] = a->dci;
 }
 
 static void xhci_usbhc_async_in_cancel(usb_async_in_t* x) {
@@ -984,6 +1078,7 @@ static void xhci_usbhc_async_in_cancel(usb_async_in_t* x) {
     }
     a->status = -1;
     x->impl = NULL;
+    xhci_async_free(a);
 }
 
 static bool xhci_usbhc_configure_endpoint(usb_hc_t* hc, uint32_t dev,

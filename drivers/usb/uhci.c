@@ -323,6 +323,8 @@ typedef struct {
 #define USB_DESC_CONFIG 2
 #define USB_DESC_INTERFACE 4
 #define USB_DESC_ENDPOINT 5
+#define USB_DESC_HID 0x21
+#define USB_DESC_HID_REPORT 0x22
 
 #define USB_REQ_GET_DESCRIPTOR 6
 #define USB_REQ_SET_ADDRESS 5
@@ -421,6 +423,17 @@ static bool uhci_get_desc(uhci_ctrl_t* hc, bool low_speed, uint8_t addr, uint8_t
     return uhci_control_transfer(hc, low_speed, addr, ep0_mps, &setup, buf, len);
 }
 
+static bool uhci_get_report_desc(uhci_ctrl_t* hc, bool low_speed, uint8_t addr, uint8_t ep0_mps,
+                                 uint8_t iface, void* buf, uint16_t len) {
+    usb_setup_pkt_t setup;
+    setup.bmRequestType = 0x81;
+    setup.bRequest = USB_REQ_GET_DESCRIPTOR;
+    setup.wValue = (uint16_t)(USB_DESC_HID_REPORT << 8);
+    setup.wIndex = iface;
+    setup.wLength = len;
+    return uhci_control_transfer(hc, low_speed, addr, ep0_mps, &setup, buf, len);
+}
+
 static bool uhci_set_address(uhci_ctrl_t* hc, bool low_speed, uint8_t new_addr, uint8_t ep0_mps) {
     usb_setup_pkt_t setup;
     setup.bmRequestType = 0x00;
@@ -463,6 +476,251 @@ static bool uhci_hid_set_idle(uhci_ctrl_t* hc, bool low_speed, uint8_t addr, uin
     setup.wIndex = iface_num;
     setup.wLength = 0;
     return uhci_control_transfer(hc, low_speed, addr, ep0_mps, &setup, NULL, 0);
+}
+
+#define HID_USAGE_PAGE_GENERIC 0x01
+#define HID_USAGE_PAGE_KBD 0x07
+#define HID_USAGE_PAGE_BUTTON 0x09
+#define HID_USAGE_X 0x30
+#define HID_USAGE_Y 0x31
+#define HID_USAGE_WHEEL 0x38
+
+#define HID_REPORT_MAX_TRACKED 4
+#define UHCI_HID_MAX_KEYS 16
+
+typedef struct {
+    bool used;
+    uint8_t report_id;
+    uint16_t bit_off;
+    uint16_t report_bits;
+
+    bool has_mods;
+    uint16_t mod_bit_off;
+    uint8_t mod_bit_count;
+
+    bool has_keys;
+    uint16_t keys_bit_off;
+    uint8_t keys_count;
+    uint8_t keys_size;
+
+    bool has_buttons;
+    uint16_t buttons_bit_off;
+    uint8_t buttons_count;
+
+    bool has_x;
+    uint16_t x_bit_off;
+    uint8_t x_size;
+    bool x_rel;
+
+    bool has_y;
+    uint16_t y_bit_off;
+    uint8_t y_size;
+    bool y_rel;
+
+    bool has_wheel;
+    uint16_t wheel_bit_off;
+    uint8_t wheel_size;
+    bool wheel_rel;
+} hid_report_info_t;
+
+typedef struct {
+    uint16_t usage_page;
+    uint8_t report_size;
+    uint8_t report_count;
+    uint8_t report_id;
+} hid_global_t;
+
+typedef struct {
+    uint16_t usages[16];
+    uint8_t usage_count;
+    uint16_t usage_min;
+    uint16_t usage_max;
+    bool has_usage_minmax;
+} hid_local_t;
+
+static hid_report_info_t* hid_get_report_info(hid_report_info_t* infos, size_t count, uint8_t report_id) {
+    for (size_t i = 0; i < count; i++) {
+        if (infos[i].used && infos[i].report_id == report_id) return &infos[i];
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!infos[i].used) {
+            memset(&infos[i], 0, sizeof(infos[i]));
+            infos[i].used = true;
+            infos[i].report_id = report_id;
+            return &infos[i];
+        }
+    }
+    return NULL;
+}
+
+static void hid_local_reset(hid_local_t* l) {
+    memset(l, 0, sizeof(*l));
+}
+
+static uint16_t hid_local_usage(const hid_local_t* l, uint8_t idx) {
+    if (idx < l->usage_count) return l->usages[idx];
+    if (l->has_usage_minmax && l->usage_min <= l->usage_max) {
+        uint16_t usage = (uint16_t)(l->usage_min + idx);
+        if (usage <= l->usage_max) return usage;
+    }
+    return 0;
+}
+
+static uint32_t hid_get_bits(const uint8_t* buf, uint16_t bit_off, uint8_t bit_len) {
+    uint32_t v = 0;
+    for (uint8_t i = 0; i < bit_len; i++) {
+        uint16_t b = (uint16_t)(bit_off + i);
+        uint8_t byte = buf[b >> 3];
+        uint8_t bit = (uint8_t)((byte >> (b & 7u)) & 1u);
+        v |= ((uint32_t)bit << i);
+    }
+    return v;
+}
+
+static int32_t hid_get_bits_signed(const uint8_t* buf, uint16_t bit_off, uint8_t bit_len) {
+    if (bit_len == 0) return 0;
+    uint32_t v = hid_get_bits(buf, bit_off, bit_len);
+    if (bit_len < 32 && (v & (1u << (bit_len - 1u)))) {
+        v |= ~((1u << bit_len) - 1u);
+    }
+    return (int32_t)v;
+}
+
+static bool hid_parse_report_desc(const uint8_t* desc, uint16_t len, bool is_mouse,
+                                  hid_report_info_t* out) {
+    hid_report_info_t infos[HID_REPORT_MAX_TRACKED];
+    memset(infos, 0, sizeof(infos));
+
+    hid_global_t g;
+    memset(&g, 0, sizeof(g));
+    hid_local_t l;
+    hid_local_reset(&l);
+
+    uint16_t i = 0;
+    while (i < len) {
+        uint8_t b = desc[i++];
+        if (b == 0xFE) {
+            if (i + 1 >= len) break;
+            uint8_t data_size = desc[i];
+            i = (uint16_t)(i + 2 + data_size);
+            continue;
+        }
+        uint8_t size_code = (uint8_t)(b & 0x3u);
+        uint8_t item_size = (size_code == 3) ? 4u : size_code;
+        uint8_t type = (uint8_t)((b >> 2) & 0x3u);
+        uint8_t tag = (uint8_t)((b >> 4) & 0xFu);
+        uint32_t data = 0;
+        for (uint8_t j = 0; j < item_size && i < len; j++) {
+            data |= ((uint32_t)desc[i++] << (8u * j));
+        }
+
+        if (type == 1) {
+            switch (tag) {
+            case 0x0: g.usage_page = (uint16_t)data; break;
+            case 0x7: g.report_size = (uint8_t)data; break;
+            case 0x8: g.report_id = (uint8_t)data; break;
+            case 0x9: g.report_count = (uint8_t)data; break;
+            default: break;
+            }
+        } else if (type == 2) {
+            switch (tag) {
+            case 0x0:
+                if (l.usage_count < (uint8_t)(sizeof(l.usages) / sizeof(l.usages[0]))) {
+                    l.usages[l.usage_count++] = (uint16_t)data;
+                }
+                break;
+            case 0x1: l.usage_min = (uint16_t)data; l.has_usage_minmax = true; break;
+            case 0x2: l.usage_max = (uint16_t)data; l.has_usage_minmax = true; break;
+            default: break;
+            }
+        } else if (type == 0) {
+            if (tag == 0x8) {
+                hid_report_info_t* info = hid_get_report_info(infos, HID_REPORT_MAX_TRACKED, g.report_id);
+                if (!info) {
+                    hid_local_reset(&l);
+                    continue;
+                }
+
+                bool is_const = (data & 0x01u) != 0;
+                bool is_var = (data & 0x02u) != 0;
+                bool is_rel = (data & 0x04u) != 0;
+                uint8_t count = g.report_count;
+                uint8_t size = g.report_size;
+                uint16_t bit_off = info->bit_off;
+
+                if (size != 0 && count != 0) {
+                    if (!is_const) {
+                        for (uint8_t idx = 0; idx < count; idx++) {
+                            uint16_t usage = hid_local_usage(&l, idx);
+                            uint16_t elem_off = (uint16_t)(bit_off + (uint16_t)idx * size);
+                            if (!is_mouse) {
+                                if (g.usage_page == HID_USAGE_PAGE_KBD) {
+                                    if (is_var && size == 1 && usage >= 0xE0 && usage <= 0xE7) {
+                                        if (!info->has_mods) {
+                                            info->has_mods = true;
+                                            info->mod_bit_off = elem_off;
+                                            info->mod_bit_count = (count > 8) ? 8 : count;
+                                        }
+                                    } else if (!is_var && size == 8 && !info->has_keys) {
+                                        info->has_keys = true;
+                                        info->keys_bit_off = bit_off;
+                                        info->keys_count = count;
+                                        info->keys_size = size;
+                                    }
+                                }
+                            } else {
+                                if (g.usage_page == HID_USAGE_PAGE_BUTTON && is_var && size == 1) {
+                                    if (!info->has_buttons) {
+                                        info->has_buttons = true;
+                                        info->buttons_bit_off = elem_off;
+                                        info->buttons_count = count;
+                                    }
+                                } else if (g.usage_page == HID_USAGE_PAGE_GENERIC && is_var) {
+                                    if (usage == HID_USAGE_X && !info->has_x) {
+                                        info->has_x = true;
+                                        info->x_bit_off = elem_off;
+                                        info->x_size = size;
+                                        info->x_rel = is_rel;
+                                    } else if (usage == HID_USAGE_Y && !info->has_y) {
+                                        info->has_y = true;
+                                        info->y_bit_off = elem_off;
+                                        info->y_size = size;
+                                        info->y_rel = is_rel;
+                                    } else if (usage == HID_USAGE_WHEEL && !info->has_wheel) {
+                                        info->has_wheel = true;
+                                        info->wheel_bit_off = elem_off;
+                                        info->wheel_size = size;
+                                        info->wheel_rel = is_rel;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    info->bit_off = (uint16_t)(bit_off + (uint16_t)count * size);
+                    if (info->bit_off > info->report_bits) info->report_bits = info->bit_off;
+                }
+                hid_local_reset(&l);
+            } else {
+                hid_local_reset(&l);
+            }
+        }
+    }
+
+    hid_report_info_t* best = NULL;
+    for (size_t idx = 0; idx < HID_REPORT_MAX_TRACKED; idx++) {
+        hid_report_info_t* info = &infos[idx];
+        if (!info->used) continue;
+        if (!is_mouse) {
+            if (info->has_keys && info->has_mods) { best = info; break; }
+            if (!best && info->has_keys) best = info;
+        } else {
+            if (info->has_x && info->has_y && info->has_buttons) { best = info; break; }
+            if (!best && info->has_x && info->has_y) best = info;
+        }
+    }
+    if (!best) return false;
+    *out = *best;
+    return true;
 }
 
 static bool hid_key_to_set1(uint8_t key, uint8_t* out_prefix, uint8_t* out_sc) {
@@ -574,11 +832,17 @@ typedef struct {
 
     uhci_qh_t* qh;
     uhci_td_t* td;
-    uint8_t buf[16];
+    uint8_t buf[64];
+    uint16_t poll_len;
     uint8_t toggle;
 
     uint8_t prev_kbd[8];
     bool first_read;  // 첫 번째 읽기 이후 플래그
+    bool report_proto;
+    hid_report_info_t report;
+    uint8_t prev_mod;
+    uint8_t prev_keys[UHCI_HID_MAX_KEYS];
+    uint8_t prev_keys_count;
     bool repeat_active;
     uint8_t repeat_key_hid;
     uint8_t repeat_prefix;
@@ -589,16 +853,22 @@ typedef struct {
 static uhci_hid_dev_t hid_devs[UHCI_MAX_HID];
 static int hid_dev_count = 0;
 
-static void kbd_process(uhci_hid_dev_t* dev, uint16_t actual) {
+static bool kbd_key_present(const uint8_t* keys, uint8_t count, uint8_t key) {
+    for (uint8_t i = 0; i < count; i++) {
+        if (keys[i] == key) return true;
+    }
+    return false;
+}
+
+static void kbd_process_boot(uhci_hid_dev_t* dev, uint16_t actual) {
     if (actual < 8) return;
-    
-    // 첫 번째 읽기: prev_kbd를 현재 상태로 설정하고 키 입력 처리 안함
+
     if (!dev->first_read) {
         dev->first_read = true;
         memcpy(dev->prev_kbd, dev->buf, 8);
         return;
     }
-    
+
     const uint8_t* rep = dev->buf;
     const uint8_t* prev = dev->prev_kbd;
 
@@ -623,7 +893,6 @@ static void kbd_process(uhci_hid_dev_t* dev, uint16_t actual) {
         send_scancode(mods[i].prefix, mods[i].sc, make);
     }
 
-    // 이전 리포트의 키 중 현재 리포트에 없는 키를 release
     for (int i = 2; i < 8; i++) {
         uint8_t key = prev[i];
         if (key == 0) continue;
@@ -638,7 +907,6 @@ static void kbd_process(uhci_hid_dev_t* dev, uint16_t actual) {
         }
     }
 
-    // 현재 리포트의 키 중 이전 리포트에 없는 키를 press (ZLP 또는 초기 상태는 제외)
     for (int i = 2; i < 8; i++) {
         uint8_t key = rep[i];
         if (key == 0 || key <= 0x03) continue;
@@ -660,7 +928,111 @@ static void kbd_process(uhci_hid_dev_t* dev, uint16_t actual) {
     memcpy(dev->prev_kbd, dev->buf, 8);
 }
 
-static void mouse_process(uhci_hid_dev_t* dev, uint16_t actual) {
+static bool kbd_report_extract(uhci_hid_dev_t* dev, uint16_t actual,
+                               uint8_t* mod, uint8_t* keys, uint8_t* key_count) {
+    const hid_report_info_t* r = &dev->report;
+    if (!r->has_keys || r->keys_size != 8) return false;
+    if (r->report_id != 0) {
+        if (actual < 1 || dev->buf[0] != r->report_id) return false;
+    }
+    uint16_t base = (r->report_id != 0) ? 8u : 0u;
+    uint16_t need_bits = (uint16_t)(r->keys_bit_off + (uint16_t)r->keys_count * r->keys_size);
+    uint16_t mod_bits = (uint16_t)(r->mod_bit_off + r->mod_bit_count);
+    uint16_t total_bits = (need_bits > mod_bits) ? need_bits : mod_bits;
+    if ((uint32_t)base + total_bits > (uint32_t)actual * 8u) return false;
+
+    uint8_t count = r->keys_count;
+    if (count > UHCI_HID_MAX_KEYS) count = UHCI_HID_MAX_KEYS;
+    for (uint8_t i = 0; i < count; i++) {
+        uint16_t off = (uint16_t)(base + r->keys_bit_off + (uint16_t)i * r->keys_size);
+        keys[i] = (uint8_t)hid_get_bits(dev->buf, off, r->keys_size);
+    }
+    *key_count = count;
+    if (r->has_mods) {
+        uint8_t mod_count = r->mod_bit_count;
+        if (mod_count > 8) mod_count = 8;
+        uint16_t off = (uint16_t)(base + r->mod_bit_off);
+        *mod = (uint8_t)hid_get_bits(dev->buf, off, mod_count);
+    } else {
+        *mod = 0;
+    }
+    return true;
+}
+
+static void kbd_process_report(uhci_hid_dev_t* dev, uint16_t actual) {
+    uint8_t keys[UHCI_HID_MAX_KEYS];
+    uint8_t key_count = 0;
+    uint8_t mod = 0;
+    if (!kbd_report_extract(dev, actual, &mod, keys, &key_count)) return;
+
+    if (!dev->first_read) {
+        dev->first_read = true;
+        dev->prev_mod = mod;
+        dev->prev_keys_count = key_count;
+        memset(dev->prev_keys, 0, sizeof(dev->prev_keys));
+        if (key_count) memcpy(dev->prev_keys, keys, key_count);
+        return;
+    }
+
+    uint8_t changed = (uint8_t)(mod ^ dev->prev_mod);
+
+    struct mod_map { uint8_t bit; uint8_t prefix; uint8_t sc; };
+    static const struct mod_map mods[] = {
+        { 0, 0x00, 0x1D }, // LCTRL
+        { 1, 0x00, 0x2A }, // LSHIFT
+        { 2, 0x00, 0x38 }, // LALT
+        { 4, 0xE0, 0x1D }, // RCTRL
+        { 5, 0x00, 0x36 }, // RSHIFT
+        { 6, 0xE0, 0x38 }, // RALT
+    };
+
+    for (unsigned i = 0; i < sizeof(mods) / sizeof(mods[0]); i++) {
+        uint8_t mask = (uint8_t)(1u << mods[i].bit);
+        if (!(changed & mask)) continue;
+        bool make = (mod & mask) != 0;
+        send_scancode(mods[i].prefix, mods[i].sc, make);
+    }
+
+    for (uint8_t i = 0; i < dev->prev_keys_count; i++) {
+        uint8_t key = dev->prev_keys[i];
+        if (key == 0) continue;
+        if (!kbd_key_present(keys, key_count, key)) {
+            uint8_t prefix, sc;
+            if (hid_key_to_set1(key, &prefix, &sc)) {
+                send_scancode(prefix, sc, false);
+                if (dev->repeat_active && dev->repeat_key_hid == key) dev->repeat_active = false;
+            }
+        }
+    }
+
+    for (uint8_t i = 0; i < key_count; i++) {
+        uint8_t key = keys[i];
+        if (key == 0 || key <= 0x03) continue;
+        if (!kbd_key_present(dev->prev_keys, dev->prev_keys_count, key)) {
+            uint8_t prefix, sc;
+            if (hid_key_to_set1(key, &prefix, &sc)) {
+                send_scancode(prefix, sc, true);
+                dev->repeat_active = true;
+                dev->repeat_key_hid = key;
+                dev->repeat_prefix = prefix;
+                dev->repeat_sc = sc;
+                dev->repeat_next_tick = tick + 35u;
+            }
+        }
+    }
+
+    dev->prev_mod = mod;
+    dev->prev_keys_count = key_count;
+    memset(dev->prev_keys, 0, sizeof(dev->prev_keys));
+    if (key_count) memcpy(dev->prev_keys, keys, key_count);
+}
+
+static void kbd_process(uhci_hid_dev_t* dev, uint16_t actual) {
+    if (dev->report_proto) kbd_process_report(dev, actual);
+    else kbd_process_boot(dev, actual);
+}
+
+static void mouse_process_boot(uhci_hid_dev_t* dev, uint16_t actual) {
     if (actual < 3) return;
     uint8_t buttons = dev->buf[0];
     int dx = (int8_t)dev->buf[1];
@@ -670,11 +1042,61 @@ static void mouse_process(uhci_hid_dev_t* dev, uint16_t actual) {
     mouse_inject(dx, dy, wheel, buttons);
 }
 
+static void mouse_process_report(uhci_hid_dev_t* dev, uint16_t actual) {
+    const hid_report_info_t* r = &dev->report;
+    if (!r->has_x || !r->has_y) return;
+    if (r->report_id != 0) {
+        if (actual < 1 || dev->buf[0] != r->report_id) return;
+    }
+    uint16_t base = (r->report_id != 0) ? 8u : 0u;
+    uint16_t max_bits = (uint16_t)(r->x_bit_off + r->x_size);
+    uint16_t y_bits = (uint16_t)(r->y_bit_off + r->y_size);
+    if (y_bits > max_bits) max_bits = y_bits;
+    if (r->has_buttons) {
+        uint16_t b_bits = (uint16_t)(r->buttons_bit_off + r->buttons_count);
+        if (b_bits > max_bits) max_bits = b_bits;
+    }
+    if (r->has_wheel) {
+        uint16_t w_bits = (uint16_t)(r->wheel_bit_off + r->wheel_size);
+        if (w_bits > max_bits) max_bits = w_bits;
+    }
+    if ((uint32_t)base + max_bits > (uint32_t)actual * 8u) return;
+    if (r->x_size > 16 || r->y_size > 16) return;
+
+    int dx = r->x_rel ? hid_get_bits_signed(dev->buf, (uint16_t)(base + r->x_bit_off), r->x_size)
+                      : (int)hid_get_bits(dev->buf, (uint16_t)(base + r->x_bit_off), r->x_size);
+    int dy = r->y_rel ? hid_get_bits_signed(dev->buf, (uint16_t)(base + r->y_bit_off), r->y_size)
+                      : (int)hid_get_bits(dev->buf, (uint16_t)(base + r->y_bit_off), r->y_size);
+    int wheel = 0;
+    if (r->has_wheel && r->wheel_size <= 16) {
+        wheel = r->wheel_rel ? hid_get_bits_signed(dev->buf, (uint16_t)(base + r->wheel_bit_off), r->wheel_size)
+                             : (int)hid_get_bits(dev->buf, (uint16_t)(base + r->wheel_bit_off), r->wheel_size);
+    }
+
+    int buttons = 0;
+    if (r->has_buttons) {
+        uint8_t bcount = r->buttons_count;
+        if (bcount > 8) bcount = 8;
+        buttons = (int)hid_get_bits(dev->buf, (uint16_t)(base + r->buttons_bit_off), bcount);
+    }
+
+    mouse_inject(dx, dy, wheel, buttons);
+}
+
+static void mouse_process(uhci_hid_dev_t* dev, uint16_t actual) {
+    if (dev->report_proto) mouse_process_report(dev, actual);
+    else mouse_process_boot(dev, actual);
+}
+
 static void kbd_repeat_tick(uhci_hid_dev_t* dev) {
     if (!dev->repeat_active) return;
     if (tick < dev->repeat_next_tick) return;
     bool still_down = false;
-    for (int i = 2; i < 8; i++) if (dev->prev_kbd[i] == dev->repeat_key_hid) { still_down = true; break; }
+    if (dev->report_proto) {
+        still_down = kbd_key_present(dev->prev_keys, dev->prev_keys_count, dev->repeat_key_hid);
+    } else {
+        for (int i = 2; i < 8; i++) if (dev->prev_kbd[i] == dev->repeat_key_hid) { still_down = true; break; }
+    }
     if (!still_down) { dev->repeat_active = false; return; }
     send_scancode(dev->repeat_prefix, dev->repeat_sc, true);
     dev->repeat_next_tick = tick + 5u;
@@ -689,7 +1111,7 @@ static void uhci_hid_schedule(uhci_ctrl_t* hc, uhci_hid_dev_t* dev) {
 
 static bool uhci_hid_init(uhci_ctrl_t* hc, bool low_speed, uint8_t addr,
                           uint8_t iface, uint8_t ep, uint16_t mps, bool is_mouse,
-                          uint8_t ep0_mps) {
+                          uint8_t ep0_mps, uint16_t report_len) {
     if (hid_dev_count >= UHCI_MAX_HID) return false;
     bool verbose = bootlog_enabled;
     uhci_hid_dev_t* dev = &hid_devs[hid_dev_count++];
@@ -702,6 +1124,7 @@ static bool uhci_hid_init(uhci_ctrl_t* hc, bool low_speed, uint8_t addr,
     dev->mps = mps;
     dev->is_mouse = is_mouse;
     dev->toggle = 0;
+    dev->poll_len = mps;
 
     dev->qh = (uhci_qh_t*)kmalloc_aligned(sizeof(uhci_qh_t), 16);
     dev->td = (uhci_td_t*)kmalloc_aligned(sizeof(uhci_td_t), 16);
@@ -709,14 +1132,40 @@ static bool uhci_hid_init(uhci_ctrl_t* hc, bool low_speed, uint8_t addr,
     memset(dev->qh, 0, sizeof(*dev->qh));
     memset(dev->td, 0, sizeof(*dev->td));
 
+    dev->report_proto = false;
+    memset(&dev->report, 0, sizeof(dev->report));
+    dev->prev_mod = 0;
+    dev->prev_keys_count = 0;
+    memset(dev->prev_keys, 0, sizeof(dev->prev_keys));
+
+    if (report_len > 0 && report_len <= 1024) {
+        uint8_t* report_desc = (uint8_t*)kmalloc(report_len, 0, NULL);
+        if (report_desc) {
+            if (uhci_get_report_desc(hc, low_speed, addr, ep0_mps, iface, report_desc, report_len) &&
+                hid_parse_report_desc(report_desc, report_len, is_mouse, &dev->report)) {
+                uint16_t rpt_bytes = (uint16_t)((dev->report.report_bits + 7u) / 8u);
+                if (dev->report.report_id != 0) rpt_bytes = (uint16_t)(rpt_bytes + 1);
+                if (rpt_bytes > 0) {
+                    dev->report_proto = true;
+                    dev->poll_len = rpt_bytes;
+                }
+            }
+            kfree(report_desc);
+        }
+    }
+
+    if (dev->poll_len > dev->mps) dev->poll_len = dev->mps;
+    if (dev->poll_len > sizeof(dev->buf)) dev->poll_len = sizeof(dev->buf);
+    if (dev->poll_len == 0) dev->poll_len = mps;
+
     uint8_t idle = is_mouse ? 0 : UHCI_HID_IDLE_RATE_4MS;
     (void)uhci_hid_set_idle(hc, low_speed, addr, ep0_mps, iface, idle, 0);
-    (void)uhci_hid_set_protocol(hc, low_speed, addr, ep0_mps, iface, 0);
+    (void)uhci_hid_set_protocol(hc, low_speed, addr, ep0_mps, iface, dev->report_proto ? 1 : 0);
 
     // 초기화: prev_kbd/prev_mouse를 0으로 초기화하여 첫 읽기를 모두 press로 처리하지 않음
     memset(dev->prev_kbd, 0, sizeof(dev->prev_kbd));
 
-    uint16_t blen = mps;
+    uint16_t blen = dev->poll_len;
     if (blen > sizeof(dev->buf)) blen = sizeof(dev->buf);
     td_init(dev->td, UHCI_PTR_TERM, low_speed, PID_IN, addr, ep, dev->toggle, dev->buf, blen, false);
     dev->qh->elem = phys_addr(dev->td);
@@ -777,6 +1226,7 @@ static void uhci_enumerate_port(uhci_ctrl_t* hc, bool low_speed) {
     uint8_t hid_kbd_iface = 0, hid_mouse_iface = 0;
     uint8_t hid_kbd_ep = 0, hid_mouse_ep = 0;
     uint16_t hid_kbd_mps = 0, hid_mouse_mps = 0;
+    uint16_t hid_kbd_report_len = 0, hid_mouse_report_len = 0;
     bool in_kbd = false;
     bool in_mouse = false;
 
@@ -792,6 +1242,19 @@ static void uhci_enumerate_port(uhci_ctrl_t* hc, bool low_speed) {
             in_mouse = (ifd->bInterfaceClass == 0x03 && ifd->bInterfaceSubClass == 0x01 && ifd->bInterfaceProtocol == 0x02);
             if (in_kbd) hid_kbd_iface = ifd->bInterfaceNumber;
             if (in_mouse) hid_mouse_iface = ifd->bInterfaceNumber;
+        } else if ((in_kbd || in_mouse) && type == USB_DESC_HID && len >= 9) {
+            uint8_t num_desc = cfg_buf[off + 5];
+            uint16_t desc_off = (uint16_t)(off + 6);
+            for (uint8_t d = 0; d < num_desc; d++) {
+                if (desc_off + 2 >= off + len) break;
+                uint8_t desc_type = cfg_buf[desc_off];
+                uint16_t desc_len = (uint16_t)(cfg_buf[desc_off + 1] | (cfg_buf[desc_off + 2] << 8));
+                if (desc_type == USB_DESC_HID_REPORT) {
+                    if (in_kbd) hid_kbd_report_len = desc_len;
+                    if (in_mouse) hid_mouse_report_len = desc_len;
+                }
+                desc_off = (uint16_t)(desc_off + 3);
+            }
         } else if ((in_kbd || in_mouse) && type == USB_DESC_ENDPOINT && len >= sizeof(usb_endpoint_desc_t)) {
             usb_endpoint_desc_t* epd = (usb_endpoint_desc_t*)(cfg_buf + off);
             if ((epd->bmAttributes & 0x3) == 0x3) {
@@ -812,8 +1275,10 @@ static void uhci_enumerate_port(uhci_ctrl_t* hc, bool low_speed) {
         return;
     }
 
-    if (hid_kbd_ep) (void)uhci_hid_init(hc, low_speed, addr, hid_kbd_iface, hid_kbd_ep, hid_kbd_mps, false, ep0_mps);
-    if (hid_mouse_ep) (void)uhci_hid_init(hc, low_speed, addr, hid_mouse_iface, hid_mouse_ep, hid_mouse_mps, true, ep0_mps);
+    if (hid_kbd_ep) (void)uhci_hid_init(hc, low_speed, addr, hid_kbd_iface, hid_kbd_ep,
+                                        hid_kbd_mps, false, ep0_mps, hid_kbd_report_len);
+    if (hid_mouse_ep) (void)uhci_hid_init(hc, low_speed, addr, hid_mouse_iface, hid_mouse_ep,
+                                          hid_mouse_mps, true, ep0_mps, hid_mouse_report_len);
 
     kfree(cfg_buf);
 }
@@ -933,7 +1398,7 @@ void uhci_poll(void) {
         // else: actual == 0 이고 에러 없음 (ZLP or timeout) - 토글 비트 유지
 
         // Rearm: 현재 토글 비트로 다음 전송 준비
-        uint16_t blen = dev->mps;
+        uint16_t blen = dev->poll_len;
         if (blen > sizeof(dev->buf)) blen = sizeof(dev->buf);
         td_init(td, UHCI_PTR_TERM, dev->low_speed, PID_IN, dev->addr, dev->ep, dev->toggle, dev->buf, blen, false);
         dev->qh->elem = phys_addr(td);

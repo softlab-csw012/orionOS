@@ -47,6 +47,19 @@
 
 #define ELF_USER_VADDR_MIN 0x08000000u
 #define ELF_USER_VADDR_MAX 0xBFFFFFFFu
+#define EFLAGS_IF 0x200u
+
+static inline uint32_t irq_save(void) {
+    uint32_t flags = 0;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static inline void irq_restore(uint32_t flags) {
+    if (flags & EFLAGS_IF) {
+        __asm__ volatile("sti" ::: "memory");
+    }
+}
 
 typedef struct __attribute__((packed)) {
     unsigned char e_ident[EI_NIDENT];
@@ -324,6 +337,7 @@ bool elf_load_image(const char* path,
                     uint32_t* out_entry,
                     uint32_t* out_image_base,
                     uint32_t* out_image_size,
+                    uint32_t* out_load_base,
                     bool* out_is_elf) {
     if (out_is_elf) {
         *out_is_elf = false;
@@ -485,20 +499,26 @@ bool elf_load_image(const char* path,
         }
     }
 
+    uint32_t irq_flags = irq_save();
     for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
         uint32_t phys = 0;
         if (vmm_virt_to_phys((uint32_t)image + off, &phys) != 0) {
             kprint("[ELF] image phys lookup failed\n");
+            irq_restore(irq_flags);
             kfree(image);
             kfree(file);
             return false;
         }
         vmm_map_page(load_base + off, phys, PAGE_PRESENT | PAGE_RW | PAGE_USER);
     }
+    irq_restore(irq_flags);
 
     *out_entry = eh->e_entry + load_bias;
     *out_image_base = (uint32_t)image;
     *out_image_size = image_size;
+    if (out_load_base) {
+        *out_load_base = load_base;
+    }
 
     kfree(file);
     return true;

@@ -11,6 +11,7 @@
 #include "../cpu/idt.h"
 #include "../cpu/isr.h"
 #include "../drivers/keyboard.h"
+#include "../drivers/mouse.h"
 #include "../drivers/screen.h"
 #include "../drivers/spk.h"
 #include "../libc/string.h"
@@ -39,6 +40,17 @@
 #define SH_MOTD 27
 #define SYS_GET_CURSOR_OFFSET 28
 #define SYS_SET_CURSOR_OFFSET 29
+#define SYS_FB_INFO 30
+#define SYS_FB_FILL_RECT 31
+#define SYS_FB_DRAW_TEXT 32
+#define SYS_CURSOR_VISIBLE 33
+#define SYS_MOUSE_STATE 34
+#define SYS_MOUSE_DRAW 35
+#define SYS_GETKEY_NB 36
+#define SYS_GUI_BIND 37
+#define SYS_GUI_SEND 38
+#define SYS_GUI_RECV 39
+#define SYS_DIR_LIST 40
 
 #define MAX_OPEN_FILES 16
 #define MAX_PATH_LEN   256
@@ -55,6 +67,59 @@
 #define EXEC_ERR_INVAL  ((uint32_t)-5)
 #define EXEC_ERR_PERM   ((uint32_t)-6)
 
+#define SYS_FB_TEXT_TRANSPARENT 0x1u
+#define GUI_MSG_TEXT_MAX 256
+
+typedef struct {
+    int32_t x;
+    int32_t y;
+    int32_t w;
+    int32_t h;
+    uint32_t color;
+} sys_fb_rect_t;
+
+typedef struct {
+    int32_t x;
+    int32_t y;
+    uint32_t fg;
+    uint32_t bg;
+    uint32_t flags;
+    uint32_t text_ptr;
+} sys_fb_text_t;
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;
+    uint32_t bpp;
+    uint32_t bytes_per_pixel;
+    uint32_t font_w;
+    uint32_t font_h;
+} sys_fb_info_t;
+
+typedef struct {
+    int32_t x;
+    int32_t y;
+    int32_t buttons;
+} sys_mouse_state_t;
+
+typedef struct {
+    uint32_t sender_pid;
+    uint32_t type;
+    int32_t a;
+    int32_t b;
+    int32_t c;
+    char text[GUI_MSG_TEXT_MAX];
+} sys_gui_msg_t;
+
+typedef struct {
+    uint32_t path_ptr;
+    uint32_t names_ptr;
+    uint32_t is_dir_ptr;
+    uint32_t max_entries;
+    uint32_t name_len;
+} sys_dir_list_t;
+
 typedef struct {
     int used;
     uint32_t owner_pid;
@@ -64,6 +129,31 @@ typedef struct {
 } syscall_fd_t;
 
 static syscall_fd_t fd_table[MAX_OPEN_FILES];
+
+#define GUI_QUEUE_MAX 64
+static sys_gui_msg_t gui_queue[GUI_QUEUE_MAX];
+static uint32_t gui_queue_head = 0;
+static uint32_t gui_queue_tail = 0;
+static uint32_t gui_server_pid = 0;
+
+static bool gui_queue_push(const sys_gui_msg_t* msg) {
+    uint32_t next = (gui_queue_head + 1u) % GUI_QUEUE_MAX;
+    if (next == gui_queue_tail) {
+        return false;
+    }
+    gui_queue[gui_queue_head] = *msg;
+    gui_queue_head = next;
+    return true;
+}
+
+static bool gui_queue_pop(sys_gui_msg_t* out) {
+    if (gui_queue_head == gui_queue_tail) {
+        return false;
+    }
+    *out = gui_queue[gui_queue_tail];
+    gui_queue_tail = (gui_queue_tail + 1u) % GUI_QUEUE_MAX;
+    return true;
+}
 
 static uint32_t console_write_lock(void) {
     uint32_t flags = 0;
@@ -634,12 +724,13 @@ void syscall_handler(registers_t* regs) {
             uint32_t entry = 0;
             uint32_t image_base = 0;
             uint32_t image_size = 0;
+            uint32_t image_load_base = 0;
             if (!fscmd_exists(path)) {
                 free_kernel_argv(argv, argc);
                 regs->eax = EXEC_ERR_NOENT;
                 break;
             }
-            if (!bin_load_image(path, &entry, &image_base, &image_size)) {
+            if (!bin_load_image(path, &entry, &image_base, &image_size, &image_load_base)) {
                 free_kernel_argv(argv, argc);
                 regs->eax = EXEC_ERR_NOEXEC;
                 break;
@@ -654,7 +745,7 @@ void syscall_handler(registers_t* regs) {
                 regs->eax = EXEC_ERR_PERM;
                 break;
             }
-            if (!proc_exec(cur, entry, image_base, image_size,
+            if (!proc_exec(cur, entry, image_base, image_size, image_load_base,
                            (const char* const*)argv, argc)) {
                 free_kernel_argv(argv, argc);
                 if (image_base) {
@@ -772,6 +863,184 @@ void syscall_handler(registers_t* regs) {
             }
             set_cursor_offset(offset);
             regs->eax = 0;
+            break;
+        }
+
+        case SYS_FB_INFO: {
+            if (!ebx || validate_user_buffer(ebx, sizeof(sys_fb_info_t)) != 0) {
+                regs->eax = 0;
+                break;
+            }
+            screen_fb_info_t info;
+            if (!screen_get_framebuffer_info(&info)) {
+                regs->eax = 0;
+                break;
+            }
+            sys_fb_info_t out = {
+                .width = info.width,
+                .height = info.height,
+                .pitch = info.pitch,
+                .bpp = info.bpp,
+                .bytes_per_pixel = info.bytes_per_pixel,
+                .font_w = info.font_w,
+                .font_h = info.font_h,
+            };
+            memcpy((void*)ebx, &out, sizeof(out));
+            regs->eax = 1;
+            break;
+        }
+
+        case SYS_FB_FILL_RECT: {
+            if (!ebx || validate_user_buffer(ebx, sizeof(sys_fb_rect_t)) != 0) {
+                regs->eax = 0;
+                break;
+            }
+            sys_fb_rect_t rect = *(sys_fb_rect_t*)ebx;
+            screen_fb_fill_rect(rect.x, rect.y, rect.w, rect.h, rect.color);
+            regs->eax = 1;
+            break;
+        }
+
+        case SYS_FB_DRAW_TEXT: {
+            if (!ebx || validate_user_buffer(ebx, sizeof(sys_fb_text_t)) != 0) {
+                regs->eax = 0;
+                break;
+            }
+            sys_fb_text_t text = *(sys_fb_text_t*)ebx;
+            if (!text.text_ptr) {
+                regs->eax = 0;
+                break;
+            }
+            char buf[256];
+            if (copy_user_string(buf, text.text_ptr, sizeof(buf)) != 0) {
+                regs->eax = 0;
+                break;
+            }
+            bool transparent = (text.flags & SYS_FB_TEXT_TRANSPARENT) != 0;
+            screen_fb_draw_text(text.x, text.y, buf, text.fg, text.bg, transparent);
+            regs->eax = 1;
+            break;
+        }
+
+        case SYS_CURSOR_VISIBLE: {
+            screen_set_cursor_visible(ebx != 0);
+            regs->eax = 1;
+            break;
+        }
+
+        case SYS_MOUSE_STATE: {
+            if (!ebx || validate_user_buffer(ebx, sizeof(sys_mouse_state_t)) != 0) {
+                regs->eax = 0;
+                break;
+            }
+            sys_mouse_state_t out = {
+                .x = mouse.x,
+                .y = mouse.y,
+                .buttons = mouse.buttons,
+            };
+            memcpy((void*)ebx, &out, sizeof(out));
+            regs->eax = 1;
+            break;
+        }
+
+        case SYS_MOUSE_DRAW: {
+            mouse_set_draw(ebx != 0);
+            regs->eax = 1;
+            break;
+        }
+
+        case SYS_GETKEY_NB: {
+            regs->eax = (uint32_t)getkey_nonblock();
+            break;
+        }
+
+        case SYS_GUI_BIND: {
+            uint32_t pid = proc_current_pid();
+            if (gui_server_pid != 0 && gui_server_pid != pid && proc_pid_alive(gui_server_pid)) {
+                regs->eax = 0;
+                break;
+            }
+            gui_server_pid = pid;
+            gui_queue_head = 0;
+            gui_queue_tail = 0;
+            regs->eax = 1;
+            break;
+        }
+
+        case SYS_GUI_SEND: {
+            if (!gui_server_pid) {
+                regs->eax = 0;
+                break;
+            }
+            if (!ebx || validate_user_buffer(ebx, sizeof(sys_gui_msg_t)) != 0) {
+                regs->eax = 0;
+                break;
+            }
+            sys_gui_msg_t msg = *(sys_gui_msg_t*)ebx;
+            msg.sender_pid = proc_current_pid();
+            uint32_t flags = console_write_lock();
+            bool ok = gui_queue_push(&msg);
+            console_write_unlock(flags);
+            regs->eax = ok ? 1u : 0u;
+            break;
+        }
+
+        case SYS_GUI_RECV: {
+            if (proc_current_pid() != gui_server_pid) {
+                regs->eax = 0;
+                break;
+            }
+            if (!ebx || validate_user_buffer(ebx, sizeof(sys_gui_msg_t)) != 0) {
+                regs->eax = 0;
+                break;
+            }
+            sys_gui_msg_t msg;
+            uint32_t flags = console_write_lock();
+            bool ok = gui_queue_pop(&msg);
+            console_write_unlock(flags);
+            if (!ok) {
+                regs->eax = 0;
+                break;
+            }
+            memcpy((void*)ebx, &msg, sizeof(msg));
+            regs->eax = 1;
+            break;
+        }
+
+        case SYS_DIR_LIST: { // dir_list(req)
+            if (!ebx || validate_user_buffer(ebx, sizeof(sys_dir_list_t)) != 0) {
+                regs->eax = (uint32_t)-1;
+                break;
+            }
+            sys_dir_list_t req = *(sys_dir_list_t*)ebx;
+            if (!req.names_ptr || !req.is_dir_ptr || req.max_entries == 0 || req.name_len == 0) {
+                regs->eax = 0;
+                break;
+            }
+            uint32_t max_entries = req.max_entries;
+            uint32_t name_len = req.name_len;
+            if (max_entries > 256) max_entries = 256;
+            if (name_len > 64) name_len = 64;
+            uint32_t names_size = max_entries * name_len;
+            if (validate_user_buffer(req.names_ptr, names_size) != 0 ||
+                validate_user_buffer(req.is_dir_ptr, max_entries) != 0) {
+                regs->eax = (uint32_t)-1;
+                break;
+            }
+            char path[MAX_PATH_LEN];
+            const char* use_path = NULL;
+            if (req.path_ptr) {
+                if (copy_user_string(path, req.path_ptr, sizeof(path)) != 0) {
+                    regs->eax = (uint32_t)-1;
+                    break;
+                }
+                if (path[0] != '\0') {
+                    use_path = path;
+                }
+            }
+            int count = fscmd_list_dir(use_path, (char*)req.names_ptr,
+                                       (uint8_t*)req.is_dir_ptr, max_entries, name_len);
+            regs->eax = (count < 0) ? (uint32_t)-1 : (uint32_t)count;
             break;
         }
 

@@ -18,9 +18,12 @@ start:
     mov ebx, [fd]
     int 0xA5
 
-    mov eax, 8
-    mov ebx, 0
-    int 0xA5
+loop:
+    jmp loop
+
+;mov eax, 8
+;mov ebx, 0
+;int 0xA5
 
 con: db "console", 0
 
