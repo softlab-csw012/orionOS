@@ -229,14 +229,6 @@ void msleep(uint32_t millisecond) {
     }
 }
 
-void wj(void) {
-    kprint_color("Y", 2, 0);
-    kprint_color("E", 9, 0);
-    kprint_color("O", 12, 0);
-    kprint_color("J", 14, 0);
-    kprint_color("U", 15, 0);
-}
-
 //ver
 void ver() {
     kprint_color("             I                 OO    SS   \n", 9, 0);
@@ -256,12 +248,12 @@ void ver() {
     putchar_color(0x85, 4, 15);
     putchar_color(0x86, 0, 15);
 	kprint("\norionOS [version 80 SV (");
-    //kprint_color("");
-    wj();
+    kprint_color("DOKDO2", 9, 0);
     kprint(")]");
-    kprint("\nkernel: orion 80_SV12 (rev 20260121)");
+    kprint("\nkernel: orion 80_SV13 (rev 20260128)");
     kprint("\nbootloader: LIMINE");
     kprint("\nprotocol: multiboot2");
+    kprint("\n32bit(Protected Mode)");
 	kprint("\nCopyright (c) 2026 Softlab. Licensed under OPL & BSD v1.0.");
     kprint("\nmade by csw012");
     kprint("\n");
