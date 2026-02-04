@@ -170,7 +170,6 @@ bool bin_load_image(const char* path, uint32_t* out_entry, uint32_t* out_image_b
     uint32_t entry = 0;
     uint32_t image_base = 0;
     uint32_t image_size = 0;
-    uint32_t image_load_base = 0;
     bool is_elf = false;
 
     if (elf_load_image(path, &entry, &image_base, &image_size, out_load_base, &is_elf)) {
