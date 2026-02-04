@@ -1,0 +1,2 @@
+welcome to orionOS! 9, 0
+Type help to see a list of commands. 15, 0
