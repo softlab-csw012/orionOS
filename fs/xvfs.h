@@ -6,8 +6,8 @@
 
 #define XVFS_MAGIC 0x58564653  // 'XVFS'
 #define XVFS_BLOCK_SIZE 512
-#define XVFS_MAX_FILES (XVFS_BLOCK_SIZE / sizeof(XVFS_FileEntry))
 #define XVFS_MAX_NAME 16
+#define XVFS_MAX_EXTENTS 6
 #define CAT_BUF_SIZE 4096
 
 extern uint8_t xvfs_drive;
@@ -23,11 +23,20 @@ typedef struct {
 } __attribute__((packed)) XVFS_Superblock;
 
 typedef struct {
-    char name[XVFS_MAX_NAME];
     uint32_t start;
-    uint32_t size;
+    uint32_t length;
+} __attribute__((packed)) XVFS_Extent;
+
+typedef struct {
+    char name[XVFS_MAX_NAME];
+    uint32_t size_bytes;
     uint8_t attr; // 0 = file, 1 = dir
+    uint8_t extent_count;
+    uint16_t reserved;
+    XVFS_Extent ext[XVFS_MAX_EXTENTS];
 } __attribute__((packed)) XVFS_FileEntry;
+
+#define XVFS_MAX_FILES (XVFS_BLOCK_SIZE / sizeof(XVFS_FileEntry))
 
 bool xvfs_init(uint8_t drive, uint32_t base_lba);
 void xvfs_ls(const char* path);

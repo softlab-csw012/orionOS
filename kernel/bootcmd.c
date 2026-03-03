@@ -3,14 +3,19 @@
 #include "bootcmd.h"
 #include "kernel.h"
 #include "ramdisk.h"
-#include "../drivers/screen.h"  // kprint 등
+#include "../kernel/io/console.h"
+#include "../drivers/screen.h"
 #include "../drivers/keyboard.h"
 #include "../fs/fscmd.h"
 #include "../libc/string.h"
 #include "../kernel/kernel.h"
 #include "../mm/paging.h"
 #include "multiboot.h"
+#include "limine.h"
 #include "cmd.h"
+#include "devfs.h"
+#include "../drivers/ramdisk.h"
+#include "../drivers/font.h"
 
 char* boot_cmdline = NULL;
 extern int current_drive;
@@ -18,20 +23,40 @@ bool enable_font = false;
 bool ramdisk_enable = false;
 char ramdisk_path[PATH_MAX];
 bool ramdisk_mod_present = false;
-uint32_t ramdisk_mod_start = 0;
-uint32_t ramdisk_mod_end = 0;
+uintptr_t ramdisk_mod_start = 0;
+uintptr_t ramdisk_mod_end = 0;
 char ramdisk_mod_cmdline[64];
 extern bool ramdisk_auto_mount;
 int rootdisk = -1; // -1 = auto, 0~ = specific disk number
+static const char* k_initramfs_default_path = "/boot/ramdisk.img";
+
+static void bootcmd_activate_ramdisk_root_if_any(void) {
+    int rd = ramdisk_drive_id();
+    if (rd < 0) {
+        return;
+    }
+
+    devfs_refresh_block_nodes();
+    kprintf("[bootcmd] initramfs root -> %d#\n", rd);
+    m_disk_num(rd);
+}
 
 static void try_load_default_font(bool force) {
-    const char* path = "/system/font/orion.fnt";
+    const char* path = "/unifont.hex";
+    char errmsg[64] = {0};
     if (current_fs == FS_NONE)
         return;
     if (!force && !fscmd_exists(path))
         return;
     kprint("[kernel] loading font from file...\n");
-    command_font(path);
+    if (!font_load_file(path, errmsg, sizeof(errmsg))) {
+        kprintf("[kernel] font load failed (%s)\n",
+                errmsg[0] ? errmsg : "unknown error");
+    } else if (errmsg[0]) {
+        kprintf("[kernel] font loaded with note (%s)\n", errmsg);
+    } else {
+        kprint("[kernel] font loaded\n");
+    }
 }
 
 static bool map_framebuffer_range(uint64_t addr, uint64_t size) {
@@ -47,19 +72,83 @@ static bool map_framebuffer_range(uint64_t addr, uint64_t size) {
     uint32_t start = (uint32_t)(addr & 0xFFFFF000u);
     uint32_t end_aligned = (uint32_t)((end + 0xFFFu) & 0xFFFFF000u);
 
-    uint32_t flags = PAGE_PRESENT | PAGE_RW;
-    if (paging_pat_wc_enabled())
-        flags |= PAGE_PAT;
-    else
-        flags |= PAGE_PCD;
+    uint32_t flags = PAGE_PRESENT | PAGE_RW | paging_wc_cache_flags();
 
     for (uint32_t p = start; p < end_aligned; p += PAGE_SIZE)
         vmm_map_page(p, p, flags);
+
+    kprintf("[MB2] FB cache flags: %s (PAT=%u PCD=%u PWT=%u)\n",
+            paging_pat_wc_enabled() ? "WC(PAT)" : "UC(fallback)",
+            (flags & PAGE_PAT) ? 1u : 0u,
+            (flags & PAGE_PCD) ? 1u : 0u,
+            (flags & PAGE_PWT) ? 1u : 0u);
+    dump_mapping(start);
 
     return true;
 }
 
 void parse_multiboot2(void* mbaddr) {
+    if (!mbaddr && limine_memmap_response) {
+        if (limine_module_response) {
+            volatile limine_module_response_t* mods = limine_module_response;
+            for (uint64_t i = 0; i < mods->module_count; i++) {
+                limine_file_t* mod = mods->modules[i];
+                const char* cmd = mod && mod->cmdline ? mod->cmdline : "";
+                const char* path = mod && mod->path ? mod->path : "";
+
+                bool is_ramdisk = false;
+                if (cmd[0] != '\0') {
+                    if (strstr(cmd, "ramd") || strstr(cmd, "ramdisk") ||
+                        strstr(cmd, "initrd") || strstr(cmd, "initramfs")) {
+                        is_ramdisk = true;
+                    }
+                } else if (path[0] != '\0') {
+                    if (strstr(path, "ramdisk") || strstr(path, "initrd") ||
+                        strstr(path, "initramfs")) {
+                        is_ramdisk = true;
+                    }
+                } else if (!ramdisk_mod_present) {
+                    is_ramdisk = true;
+                }
+
+                if (is_ramdisk) {
+                    uintptr_t mod_start = (uintptr_t)mod->address;
+                    uintptr_t mod_end = mod_start + (uintptr_t)mod->size;
+                    ramdisk_mod_present = true;
+                    ramdisk_mod_start = mod_start;
+                    ramdisk_mod_end = mod_end;
+                    strncpy(ramdisk_mod_cmdline, cmd, sizeof(ramdisk_mod_cmdline) - 1);
+                    ramdisk_mod_cmdline[sizeof(ramdisk_mod_cmdline) - 1] = '\0';
+                    kprintf("[LIMINE] module: %s (%016lX-%016lX)\n",
+                            ramdisk_mod_cmdline,
+                            (unsigned long)ramdisk_mod_start,
+                            (unsigned long)ramdisk_mod_end);
+                }
+            }
+        }
+
+        if (limine_framebuffer_response && limine_framebuffer_response->framebuffer_count > 0) {
+            limine_framebuffer_t* fb = limine_framebuffer_response->framebuffers[0];
+            if (fb) {
+                uint64_t fb_size = fb->pitch * fb->height;
+                if (!map_framebuffer_range((uint64_t)(uintptr_t)fb->address, fb_size)) {
+                    kprint("[LIMINE] framebuffer mapping failed\n");
+                } else {
+                    screen_set_framebuffer((uint64_t)(uintptr_t)fb->address,
+                                           (uint32_t)fb->width,
+                                           (uint32_t)fb->height,
+                                           (uint32_t)fb->pitch,
+                                           (uint8_t)fb->bpp);
+                    kprintf("[LIMINE] framebuffer %ux%u %u bpp\n",
+                            (uint32_t)fb->width,
+                            (uint32_t)fb->height,
+                            (uint32_t)fb->bpp);
+                }
+            }
+        }
+        return;
+    }
+
     if (!mbaddr) {
         kprint("[MB2] no multiboot info!\n");
         return;
@@ -134,8 +223,8 @@ void parse_multiboot2(void* mbaddr) {
                 ramdisk_mod_cmdline[sizeof(ramdisk_mod_cmdline) - 1] = '\0';
                 kprintf("[MB2] module: %s (%08X-%08X)\n",
                         ramdisk_mod_cmdline,
-                        ramdisk_mod_start,
-                        ramdisk_mod_end);
+                        (uint32_t)ramdisk_mod_start,
+                        (uint32_t)ramdisk_mod_end);
             }
         }
         if (tag->type == MULTIBOOT_TAG_TYPE_FRAMEBUFFER) {
@@ -249,24 +338,36 @@ void parse_bootcmd() {
             if (current_fs == FS_NONE) {
                 ramdisk_auto_mount = true;
                 kprint("[kernel] Since the disk type is unknown, it is mounted as a ramdisk.\n");  
-                m_disk("7");
+            }
+
+            if (ramdisk_mod_present) {
+                (void)ramdisk_load_from_module(ramdisk_mod_start, ramdisk_mod_end, ramdisk_mod_cmdline);
             }
 
             if (ramdisk_enable) {
-                ramdisk_load_from_path(ramdisk_path);
+                (void)ramdisk_load_from_path(ramdisk_path);
+            } else if (current_fs != FS_NONE && fscmd_exists(k_initramfs_default_path)) {
+                (void)ramdisk_load_from_path(k_initramfs_default_path);
             }
+            bootcmd_activate_ramdisk_root_if_any();
         } else {
             ramdisk_auto_mount = true;
             kprint("[kernel] no top drive specified\n");
             kprint("[kernel] Automatic disk mount failed, so mounting as ramdisk.\n");
-            m_disk("7");
+            if (ramdisk_mod_present) {
+                (void)ramdisk_load_from_module(ramdisk_mod_start, ramdisk_mod_end, ramdisk_mod_cmdline);
+            }
+            bootcmd_activate_ramdisk_root_if_any();
         }
 
     } else {
         ramdisk_auto_mount = true; 
         kprint("[kernel] no bootcmd\n");
         kprint("[kernel] No disk selected, mounting as ramdisk.\n");
-        m_disk("7");
+        if (ramdisk_mod_present) {
+            (void)ramdisk_load_from_module(ramdisk_mod_start, ramdisk_mod_end, ramdisk_mod_cmdline);
+        }
+        bootcmd_activate_ramdisk_root_if_any();
     }
 
     kprint("[kernel] enabling custom font from bootcmd...\n");

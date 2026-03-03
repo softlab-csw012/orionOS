@@ -1,7 +1,7 @@
 #include "hda.h"
 #include "pci.h"
 #include "hal.h"
-#include "../drivers/screen.h"
+#include "../kernel/io/console.h"
 #include "../libc/string.h"
 #include "../mm/mem.h"
 #include "../mm/paging.h"
@@ -177,49 +177,54 @@ static inline void hda_wr32(uint32_t off, uint32_t v) {
     *(volatile uint32_t*)(g_hda->mmio + off) = v;
 }
 
-static void delay_ms(uint32_t ms) {
-    extern uint32_t tick;
-    uint32_t start = tick;
-    uint32_t ticks_needed = (ms + 9u) / 10u; // PIT 100Hz => 10ms/tick
-    if (ticks_needed == 0) ticks_needed = 1;
-    while ((tick - start) < ticks_needed) {
-        hal_wait_for_interrupt();
+static void hda_spin_delay(uint32_t loops) {
+    while (loops-- > 0) {
+        hal_pause();
     }
 }
 
-static bool hda_wait_gctl_crst(bool want_set, uint32_t timeout_ms) {
-    extern uint32_t tick;
-    uint32_t start = tick;
-    uint32_t timeout_ticks = (timeout_ms + 9u) / 10u;
-    if (timeout_ticks == 0) timeout_ticks = 1;
+static void delay_ms(uint32_t ms) {
+    // HDA bring-up must not depend on IRQ delivery; some UEFI boots reach the
+    // controller before PIT/interrupt timing is reliable.
+    uint32_t loops = ms * 200000u;
+    if (loops < 200000u) {
+        loops = 200000u;
+    }
+    hda_spin_delay(loops);
+}
 
-    while (1) {
+static bool hda_wait_gctl_crst(bool want_set, uint32_t timeout_ms) {
+    uint32_t spins = timeout_ms * 500000u;
+    if (spins < 500000u) {
+        spins = 500000u;
+    }
+
+    while (spins-- > 0) {
         uint32_t gctl = hda_rd32(HDA_REG_GCTL);
         bool set = (gctl & HDA_GCTL_CRST) != 0;
         if (set == want_set)
             return true;
-        if ((tick - start) > timeout_ticks)
-            return false;
-        hal_wait_for_interrupt();
+        hal_pause();
     }
+
+    return false;
 }
 
 static bool hda_wait_state_sts(uint32_t timeout_ms) {
-    extern uint32_t tick;
-    uint32_t start = tick;
-    uint32_t timeout_ticks = (timeout_ms + 9u) / 10u;
-    if (timeout_ticks == 0) timeout_ticks = 1;
+    uint32_t spins = timeout_ms * 500000u;
+    if (spins < 500000u) {
+        spins = 500000u;
+    }
 
-    while (1) {
+    while (spins-- > 0) {
         uint16_t st = hda_rd16(HDA_REG_STATESTS);
         if ((st & 0x7FFFu) != 0) {
             return true;
         }
-        if ((tick - start) > timeout_ticks) {
-            return false;
-        }
-        hal_wait_for_interrupt();
+        hal_pause();
     }
+
+    return false;
 }
 
 static bool hda_controller_reset(void) {
@@ -623,8 +628,8 @@ static bool hda_alloc_dma(void) {
     memset(bdl, 0, sizeof(hda_bdl_entry_t) * HDA_BDL_ENTRIES);
 
     uint32_t bdl_phys = 0;
-    if (vmm_virt_to_phys((uint32_t)bdl, &bdl_phys) != 0) {
-        bdl_phys = (uint32_t)bdl;
+    if (vmm_virt_to_phys((uint32_t)(uintptr_t)bdl, &bdl_phys) != 0) {
+        bdl_phys = (uint32_t)(uintptr_t)bdl;
     }
     if (bdl_phys & 0x3FFu) {
         kprintf("[HDA] BDL not 1KB aligned (phys=%08X)\n", bdl_phys);

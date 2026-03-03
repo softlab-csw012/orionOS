@@ -1,6 +1,6 @@
 #include "ramdisk.h"
 #include "../drivers/ramdisk.h"
-#include "../drivers/screen.h"
+#include "io/console.h"
 #include "../fs/fscmd.h"
 #include "../libc/string.h"
 #include "../mm/mem.h"
@@ -9,9 +9,10 @@
 #define RAMDISK_IDENTITY_MAX 0x04000000u
 #define RAMDISK_MAP_BASE     0xC8000000u
 
-static uint8_t* ramdisk_map_module(uint32_t start, uint32_t size) {
-    uint32_t map_start = start & 0xFFFFF000u;
-    uint32_t map_end = (start + size + 0xFFFu) & 0xFFFFF000u;
+static uint8_t* ramdisk_map_module(uintptr_t start, uint32_t size) {
+    uint32_t phys_start = (uint32_t)start;
+    uint32_t map_start = phys_start & 0xFFFFF000u;
+    uint32_t map_end = (phys_start + size + 0xFFFu) & 0xFFFFF000u;
     uint32_t map_size = map_end - map_start;
 
     if (map_size == 0)
@@ -26,7 +27,7 @@ static uint8_t* ramdisk_map_module(uint32_t start, uint32_t size) {
                      PAGE_PRESENT | PAGE_RW);
     }
 
-    return (uint8_t*)(RAMDISK_MAP_BASE + (start - map_start));
+    return (uint8_t*)(uintptr_t)(RAMDISK_MAP_BASE + (phys_start - map_start));
 }
 
 bool ramdisk_load_from_path(const char* path) {
@@ -77,7 +78,7 @@ bool ramdisk_load_from_path(const char* path) {
     return true;
 }
 
-bool ramdisk_load_from_module(uint32_t start, uint32_t end, const char* name) {
+bool ramdisk_load_from_module(uintptr_t start, uintptr_t end, const char* name) {
     if (ramdisk_drive_id() >= 0) {
         kprint("[RAMDISK] already attached, skipping module load\n");
         return false;
@@ -88,12 +89,17 @@ bool ramdisk_load_from_module(uint32_t start, uint32_t end, const char* name) {
         return false;
     }
 
-    uint32_t size = end - start;
+    uintptr_t span = end - start;
+    if (span > UINT32_MAX) {
+        kprint("[RAMDISK] module too large\n");
+        return false;
+    }
+    uint32_t size = (uint32_t)span;
     const char* label = (name && *name) ? name : "module";
     uint8_t drive_id = 0;
 
-    uint8_t* data = (uint8_t*)start;
-    if (end > RAMDISK_IDENTITY_MAX) {
+    uint8_t* data = (uint8_t*)(uintptr_t)start;
+    if (start <= UINT32_MAX && end > RAMDISK_IDENTITY_MAX) {
         data = ramdisk_map_module(start, size);
         if (!data) {
             kprint("[RAMDISK] failed to map module\n");

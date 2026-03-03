@@ -1,6 +1,7 @@
 #ifndef ISR_H
 #define ISR_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* ISRs reserved for CPU exceptions */
@@ -72,18 +73,29 @@ extern void irq15();
 #define IRQ14 46
 #define IRQ15 47
 
-/* Struct which aggregates many registers.
- * It matches exactly the pushes on interrupt.asm. From the bottom:
- * - Pushed by the processor automatically
- * - `push byte`s on the isr-specific code: error code, then int number
- * - All the registers by pusha
- * - `push eax` whose lower 16-bits contain DS
- */
-typedef struct {
-   uint16_t ds; /* Data segment selector */
-   uint32_t edi, esi, ebp, useless, ebx, edx, ecx, eax; /* Pushed by pusha. */
-   uint32_t int_no, err_code; /* Interrupt number and error code (if applicable) */
-   uint32_t eip, cs, eflags, esp, ss; /* Pushed by the processor automatically */
+typedef struct __attribute__((packed)) {
+   union { uint64_t r15; };
+   union { uint64_t r14; };
+   union { uint64_t r13; };
+   union { uint64_t r12; };
+   union { uint64_t r11; };
+   union { uint64_t r10; };
+   union { uint64_t r9; };
+   union { uint64_t r8; };
+   union { uint64_t rsi; uint32_t esi; };
+   union { uint64_t rdi; uint32_t edi; };
+   union { uint64_t rbp; uint32_t ebp; };
+   union { uint64_t rdx; uint32_t edx; };
+   union { uint64_t rcx; uint32_t ecx; };
+   union { uint64_t rbx; uint32_t ebx; };
+   union { uint64_t rax; uint32_t eax; };
+   uint64_t int_no;
+   uint64_t err_code;
+   union { uint64_t rip; uint32_t eip; };
+   uint64_t cs;
+   union { uint64_t rflags; uint32_t eflags; };
+   union { uint64_t rsp; uint32_t esp; };
+   uint64_t ss;
 } registers_t;
 
 void isr_install();
@@ -91,6 +103,9 @@ void isr_handler(registers_t *r);
 void isr_dispatch(registers_t *r);
 void irq_install();
 void irq_dispatch(registers_t *r);
+void irq_set_ready(uint8_t ready);
+uint8_t irq_is_ready(void);
+void irq_enable(void);
 
 typedef void (*isr_t)(registers_t*);
 void register_interrupt_handler(uint8_t n, isr_t handler);

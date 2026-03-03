@@ -215,6 +215,7 @@ enum {
 enum {
     SCSI_OP_TEST_UNIT_READY = 0x00,
     SCSI_OP_REQUEST_SENSE = 0x03,
+    SCSI_OP_START_STOP_UNIT = 0x1B,
     SCSI_OP_READ_CAPACITY10 = 0x25,
     SCSI_OP_READ_CAPACITY16 = 0x9E,
     SCSI_SA_READ_CAPACITY16 = 0x10,
@@ -312,13 +313,11 @@ static void usb_enumerate_default(usb_hc_t* hc, usb_speed_t speed,
 static void usb_handle_hub(usb_hc_t* hc, uint32_t hub_dev, uint8_t ep0_mps,
                            usb_speed_t speed, uint8_t tt_hub_addr, uint8_t tt_port,
                            int depth);
-
+                           
 static void delay_ms(uint32_t ms) {
-    uint32_t start = tick;
-    uint32_t ticks_needed = (ms + 9) / 10;
-    if (ticks_needed == 0) ticks_needed = 1;
-    while ((tick - start) < ticks_needed) {
-        hal_wait_for_interrupt();
+    uint32_t target = tick + (ms + 9) / 10;
+    while ((int32_t)(tick - target) < 0) {
+        asm volatile("pause");
     }
 }
 
@@ -414,41 +413,6 @@ static bool usb_hid_set_idle(usb_hc_t* hc, uint32_t dev, uint8_t ep0_mps,
 #define HID_USAGE_WHEEL 0x38
 
 #define HID_REPORT_MAX_TRACKED 4
-
-typedef struct hid_report_info {
-    bool used;
-    uint8_t report_id;
-    uint16_t bit_off;
-    uint16_t report_bits;
-
-    bool has_mods;
-    uint16_t mod_bit_off;
-    uint8_t mod_bit_count;
-
-    bool has_keys;
-    uint16_t keys_bit_off;
-    uint8_t keys_count;
-    uint8_t keys_size;
-
-    bool has_buttons;
-    uint16_t buttons_bit_off;
-    uint8_t buttons_count;
-
-    bool has_x;
-    uint16_t x_bit_off;
-    uint8_t x_size;
-    bool x_rel;
-
-    bool has_y;
-    uint16_t y_bit_off;
-    uint8_t y_size;
-    bool y_rel;
-
-    bool has_wheel;
-    uint16_t wheel_bit_off;
-    uint8_t wheel_size;
-    bool wheel_rel;
-} hid_report_info_t;
 
 typedef struct {
     uint16_t usage_page;
@@ -953,6 +917,21 @@ static bool msc_scsi_request_sense(usb_msc_dev_t* dev, uint8_t* key, uint8_t* as
     return true;
 }
 
+static bool msc_scsi_start_stop_unit(usb_msc_dev_t* dev, bool start) {
+    uint8_t cdb[6] = {0};
+    cdb[0] = SCSI_OP_START_STOP_UNIT;
+    cdb[4] = start ? 0x01 : 0x00;
+    return msc_bot_cmd(dev, 0, cdb, 6, false, NULL, 0, NULL);
+}
+
+static bool msc_sense_retryable(uint8_t key, uint8_t asc, uint8_t ascq) {
+    (void)ascq;
+    if (key == 0x02 || key == 0x06 || key == 0x01 || key == 0x0B) return true;
+    /* NOT READY: becoming ready / init required */
+    if (key == 0x02 && (asc == 0x04 || asc == 0x28)) return true;
+    return false;
+}
+
 static bool msc_scsi_read_capacity10(usb_msc_dev_t* dev, uint32_t* out_last_lba, uint32_t* out_blksz) {
     uint8_t cdb[10] = {0};
     cdb[0] = SCSI_OP_READ_CAPACITY10;
@@ -1016,6 +995,7 @@ static void msc_wait_ready(usb_msc_dev_t* dev) {
 }
 
 static bool msc_scsi_read_capacity(usb_msc_dev_t* dev) {
+    (void)msc_scsi_start_stop_unit(dev, true);
     msc_wait_ready(dev);
 
     uint32_t last_lba = 0;
@@ -1043,14 +1023,16 @@ static bool msc_scsi_read_capacity(usb_msc_dev_t* dev) {
             return blksz != 0;
         }
 
+        /* Some USB-SD bridges need BOT reset-recovery between early SCSI commands. */
+        msc_reset_recovery(dev);
+        (void)msc_scsi_start_stop_unit(dev, true);
+
         uint8_t key = 0, asc = 0, ascq = 0;
-        if (msc_scsi_request_sense(dev, &key, &asc, &ascq)) {
-            if (key == 0x02 || key == 0x06) {
-                if (USB_MSC_READ_CAPACITY_NOT_READY_DELAY_MS) {
-                    delay_ms(USB_MSC_READ_CAPACITY_NOT_READY_DELAY_MS);
-                }
-                continue;
+        if (msc_scsi_request_sense(dev, &key, &asc, &ascq) && msc_sense_retryable(key, asc, ascq)) {
+            if (USB_MSC_READ_CAPACITY_NOT_READY_DELAY_MS) {
+                delay_ms(USB_MSC_READ_CAPACITY_NOT_READY_DELAY_MS);
             }
+            continue;
         }
         if (USB_MSC_READ_CAPACITY_FAIL_DELAY_MS) {
             delay_ms(USB_MSC_READ_CAPACITY_FAIL_DELAY_MS);
@@ -1201,13 +1183,17 @@ static void usb_parse_config(const uint8_t* cfg, uint16_t total_len, usb_parse_r
                 cur_bulk_out_mps = 0;
             }
 
+            /*
+             * Real hardware often exposes standard keyboards/mice as HID with the
+             * protocol field set, but not always the Boot subclass bit. Accept the
+             * interface when the HID class/protocol match and let report parsing pick
+             * the working mode.
+             */
             in_hid_kbd_iface = (ifd->bInterfaceClass == USB_CLASS_HID &&
-                                ifd->bInterfaceSubClass == USB_HID_SUBCLASS_BOOT &&
                                 ifd->bInterfaceProtocol == USB_HID_PROTO_KBD);
             if (in_hid_kbd_iface) out->hid_kbd_iface = ifd->bInterfaceNumber;
 
             in_hid_mouse_iface = (ifd->bInterfaceClass == USB_CLASS_HID &&
-                                  ifd->bInterfaceSubClass == USB_HID_SUBCLASS_BOOT &&
                                   ifd->bInterfaceProtocol == USB_HID_PROTO_MOUSE);
             if (in_hid_mouse_iface) out->hid_mouse_iface = ifd->bInterfaceNumber;
         } else if ((in_hid_kbd_iface || in_hid_mouse_iface) && type == USB_DESC_HID && len >= 9) {

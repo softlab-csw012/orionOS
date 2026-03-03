@@ -14,13 +14,13 @@ static work_item_t queue[WORKQUEUE_SIZE];
 static uint32_t head = 0;
 static uint32_t tail = 0;
 
-static uint32_t irq_save(void) {
-    uint32_t flags = 0;
-    __asm__ volatile("pushf; pop %0; cli" : "=r"(flags) :: "memory");
+static uintptr_t irq_save(void) {
+    uintptr_t flags = 0;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     return flags;
 }
 
-static void irq_restore(uint32_t flags) {
+static void irq_restore(uintptr_t flags) {
     if (flags & EFLAGS_IF) {
         __asm__ volatile("sti" ::: "memory");
     }
@@ -38,7 +38,7 @@ bool workqueue_enqueue(work_fn_t fn, void* ctx) {
     }
 
     bool ok = false;
-    uint32_t flags = irq_save();
+    uintptr_t flags = irq_save();
     uint32_t next = (head + 1u) & WORKQUEUE_MASK;
     if (next != tail) {
         queue[head].fn = fn;
@@ -52,7 +52,7 @@ bool workqueue_enqueue(work_fn_t fn, void* ctx) {
 
 bool workqueue_pending(void) {
     bool pending = false;
-    uint32_t flags = irq_save();
+    uintptr_t flags = irq_save();
     pending = (head != tail);
     irq_restore(flags);
     return pending;
@@ -63,7 +63,7 @@ void workqueue_run(void) {
         work_fn_t fn = NULL;
         void* ctx = NULL;
 
-        uint32_t flags = irq_save();
+        uintptr_t flags = irq_save();
         if (head != tail) {
             fn = queue[tail].fn;
             ctx = queue[tail].ctx;

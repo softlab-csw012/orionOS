@@ -4,6 +4,8 @@
 #include "workqueue.h"
 #include "../bin.h"
 #include "../kernel.h"
+#include "../syscall.h"
+#include "../tty.h"
 #include "../../libc/string.h"
 #include "../../drivers/hal.h"
 #include "../../drivers/keyboard.h"
@@ -14,7 +16,7 @@
 #include "../../drivers/usb/xhci.h"
 
 static bool sysmgr_console_active(void) {
-    return prompt_enabled && keyboard_input_enabled && !script_running;
+    return enable_shell && prompt_enabled && keyboard_input_enabled && !script_running;
 }
 
 static void sysmgr_console_begin(bool* started) {
@@ -52,23 +54,56 @@ static void sysmgr_launch_process(const char* path,
         if (err_prefix) {
             kprint(err_prefix);
         }
-        keyboard_input_enabled = true;
-        prompt_enabled = true;
-        shell_suspended = false;
-        sysmgr_request_prompt();
+        keyboard_input_enabled = false;
+        prompt_enabled = false;
+        shell_suspended = true;
         return;
+    }
+
+    attach_default_stdio(p->pid, proc_current_pid());
+    proc_set_vc(p, tty_get_active_vc());
+    if (strcmp(path, "/cmd/shell") == 0) {
+        tty_vc_set_shell_pid(tty_get_active_vc(), p->pid);
     }
 
     if (background) {
         kprintf("[bg] pid %u\n", p->pid);
-        keyboard_input_enabled = true;
-        prompt_enabled = true;
-        shell_suspended = false;
-        sysmgr_request_prompt();
+        keyboard_input_enabled = false;
+        prompt_enabled = false;
+        shell_suspended = true;
         return;
     }
 
+    keyboard_input_enabled = false;
+    prompt_enabled = false;
+    shell_suspended = true;
     proc_set_foreground_pid(p->pid);
+    if (strcmp(path, "/cmd/shell") == 0) {
+        tty_reset_input_state();
+    }
+}
+
+static void sysmgr_ensure_active_vc_shell(void) {
+    uint8_t vc = tty_get_active_vc();
+    if (!tty_vc_should_spawn_shell(vc)) {
+        return;
+    }
+    const char* path = "/cmd/shell";
+    const char* argv[] = { path };
+    process_t* p = bin_create_process(path, argv, 1, false);
+    if (!p) {
+        return;
+    }
+    attach_default_stdio(p->pid, proc_current_pid());
+    proc_set_vc(p, vc);
+    tty_vc_set_shell_pid(vc, p->pid);
+    if (vc == tty_get_active_vc()) {
+        proc_set_foreground_pid(p->pid);
+        keyboard_input_enabled = false;
+        prompt_enabled = false;
+        shell_suspended = true;
+        tty_reset_input_state();
+    }
 }
 
 void sysmgr_note_prompt(void) {
@@ -160,11 +195,12 @@ void sysmgr_thread(void) {
         }
         if (sysmgr_user_shell_pending) {
             sysmgr_user_shell_pending = false;
-            const char* path = "/cmd/shell.sys";
+            const char* path = "/cmd/shell";
             const char* argv[] = { path };
-            sysmgr_launch_process(path, argv, 1, false, "sh: failed to start /cmd/shell.sys\n");
+            sysmgr_launch_process(path, argv, 1, false, "sh: failed to start /cmd/shell\n");
             had_output = true;
         }
+        sysmgr_ensure_active_vc_shell();
         timer_task_run_due();
         if (had_output) {
             sysmgr_prompt_pending = true;

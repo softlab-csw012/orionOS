@@ -1,6 +1,8 @@
 #ifndef SYSMGR_H
 #define SYSMGR_H
 
+#include <stdbool.h>
+
 __attribute__((noreturn)) void sysmgr_thread(void);
 __attribute__((noreturn)) void sysmgr_idle_loop(void);
 void sysmgr_note_prompt(void);

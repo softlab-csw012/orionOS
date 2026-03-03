@@ -1,7 +1,7 @@
 #include "../cpu/isr.h"
 #include "../cpu/ports.h"
 #include "../cpu/timer.h"
-#include "../drivers/screen.h"
+#include "io/console.h"
 #include "../drivers/font.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/spk.h"
@@ -35,6 +35,7 @@
 #include "../mm/paging.h"
 #include "cmd.h"
 #include "multiboot.h"
+#include "devfs.h"
 #include <stdint.h>
 
 extern int current_drive; 
@@ -89,29 +90,38 @@ void print(const char *str, int len) {
     }
 }
 
-void cpuid_str(uint32_t code, uint32_t *dest) {
+static inline void cpuid(uint32_t leaf,
+                         uint32_t *a, uint32_t *b,
+                         uint32_t *c, uint32_t *d)
+{
     __asm__ volatile("cpuid"
-                     : "=a"(dest[0]), "=b"(dest[1]), "=c"(dest[2]), "=d"(dest[3])
-                     : "a"(code));
+                     : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d)
+                     : "a"(leaf));
 }
 
 void get_cpu_brand(char *out_str) {
-    uint32_t max;
+    uint32_t a,b,c,d;
+
     memset(out_str, 0, 49);
 
-    cpuid_str(0x80000000, &max);
-    if (max < 0x80000004) {
-        strcpy(out_str, "Unknown CPU");
+    cpuid(0x80000000,&a,&b,&c,&d);
+    if (a < 0x80000004) {
+        strcpy(out_str,"Unknown CPU");
         return;
     }
 
-    uint32_t *ptr = (uint32_t*)out_str;
-    for (uint32_t i = 0; i < 3; ++i) {
-        cpuid_str(0x80000002 + i, ptr);
-        ptr += 4;
-    }
+    uint32_t* p=(uint32_t*)out_str;
 
-    out_str[48] = '\0';
+    cpuid(0x80000002,&a,&b,&c,&d);
+    p[0]=a; p[1]=b; p[2]=c; p[3]=d;
+
+    cpuid(0x80000003,&a,&b,&c,&d);
+    p[4]=a; p[5]=b; p[6]=c; p[7]=d;
+
+    cpuid(0x80000004,&a,&b,&c,&d);
+    p[8]=a; p[9]=b; p[10]=c; p[11]=d;
+
+    out_str[48]=0;
 }
 
 void get_cpu_vendor(char *vendor_str) {
@@ -655,12 +665,7 @@ void reboot() {
 
 //disk
 void fs_unmount_all(void) {
-    current_drive = -1;
-    current_fs = FS_NONE;
-
-    fat16_drive = -1;
-    fat32_drive = -1;
-    xvfs_drive  = -1;
+    fscmd_clear_mounts();
 }
 
 void m_disk(const char* cmd) {
@@ -670,6 +675,31 @@ void m_disk(const char* cmd) {
     // ──────────────── "disk ls" ────────────────
     if (strcmp(cmd, "ls") == 0 || strcmp(cmd, "disk ls") == 0) {
         cmd_disk_ls();
+        return;
+    }
+
+    // ──────────────── "disk /dev/<block-node>" ────────────────
+    if (strncmp(cmd, "/dev/", 5) == 0) {
+        uint8_t node_type = 0;
+        uint16_t major = 0;
+        uint16_t minor = 0;
+        if (!devfs_lookup(cmd, &node_type, &major, &minor)) {
+            kprintf("Device node not found: %s\n", cmd);
+            return;
+        }
+        if (node_type != DEV_NODE_BLOCK) {
+            kprintf("%s is not a block device node.\n", cmd);
+            return;
+        }
+        if (!(major == 8u || major == 9u || major == 10u || major == 11u || major == 12u)) {
+            kprintf("%s: unsupported block major %u\n", cmd, (uint32_t)major);
+            return;
+        }
+        if (minor >= MAX_DISKS) {
+            kprintf("%s: invalid drive id %u\n", cmd, (uint32_t)minor);
+            return;
+        }
+        m_disk_num((int)minor);
         return;
     }
 
@@ -691,68 +721,11 @@ void m_disk(const char* cmd) {
             kprintf("Drive %d not detected.\n", d);
             return;
         }
-
-        const char* type = disks[d].fs_type;
-        uint32_t base = disks[d].base_lba;
-        if (strcmp(type, "Unknown") == 0 || strcmp(type, "MBR") == 0) {
-            refresh_disk_kind(d);
-            type = disks[d].fs_type;
-            base = disks[d].base_lba;
-        }
-
-        // ───── FAT16 ─────
-        if (strcmp(type, "FAT16") == 0) {
-            if (fat16_init(d, base)) {
-                fat16_drive = d;
-                current_drive = d;
-                current_fs = FS_FAT16;
-
-                fscmd_reset_path();
-
-                kprintf("Drive %d mounted successfully as FAT16.\n", d);
-            } else {
-                kprintf("Failed to mount drive %d (FAT16 init error)\n", d);
-            }
-        }
-
-        // ───── FAT32 ─────
-        else if (strcmp(type, "FAT32") == 0) {
-            if (fat32_init(d, base)) {
-                fat32_drive = d;
-                current_drive = d;
-                current_fs = FS_FAT32;
-
-                fscmd_reset_path();
-
-                kprintf("Drive %d mounted successfully as FAT32.\n", d);
-            } else {
-                kprintf("Failed to mount drive %d (FAT32 init error)\n", d);
-            }
-        }
-
-        // ───── XVFS ─────
-        else if (strcmp(type, "XVFS") == 0) {
-            if (xvfs_init(d, base)) {
-                xvfs_drive = d;
-                current_drive = d;
-                current_fs = FS_XVFS;
-
-                fscmd_reset_path();
-
-                kprintf("Drive %d mounted successfully as XVFS.\n", d);
-            } else {
-                kprintf("Failed to mount drive %d (XVFS init error)\n", d);
-            }
-        }
-
-        else {
-            kprintf("Drive %d: Unsupported filesystem (%s)\n", d, type);
-        }
-
+        m_disk_num(d);
         return;
     }
 
-    kprintf("Usage: disk <0-%d> | disk ls\n", MAX_DISKS - 1);
+    kprintf("Usage: disk ls | disk <0-%d> | disk /dev/<block>\n", MAX_DISKS - 1);
 }
 
 void m_disk_num(int disk) {
@@ -767,50 +740,29 @@ void m_disk_num(int disk) {
     }
 
     const char* type = disks[disk].fs_type;
-    uint32_t base = disks[disk].base_lba;
 
     if (strcmp(type, "Unknown") == 0 || strcmp(type, "MBR") == 0) {
         refresh_disk_kind(disk);
         type = disks[disk].fs_type;
-        base = disks[disk].base_lba;
     }
 
-    bool mounted = false;
-
-    if (strcmp(type, "FAT16") == 0) {
-        mounted = fat16_init(disk, base);
-        if (mounted) {
-            fat16_drive = disk;
-            current_fs = FS_FAT16;
-        }
-    }
-    else if (strcmp(type, "FAT32") == 0) {
-        mounted = fat32_init(disk, base);
-        if (mounted) {
-            fat32_drive = disk;
-            current_fs = FS_FAT32;
-        }
-    }
-    else if (strcmp(type, "XVFS") == 0) {
-        mounted = xvfs_init(disk, base);
-        if (mounted) {
-            xvfs_drive = disk;
-            current_fs = FS_XVFS;
-        }
-    }
-    else {
+    if (!(strcmp(type, "FAT16") == 0 || strcmp(type, "FAT32") == 0 || strcmp(type, "XVFS") == 0)) {
         kprintf("Drive %d: Unsupported filesystem (%s)\n", disk, type);
         return;
     }
 
-    if (!mounted) {
+    if (!fscmd_mount_drive_at(disk, "/")) {
         kprintf("Failed to mount drive %d (%s init error)\n", disk, type);
         return;
     }
 
-    // ✅ 여기서만 전역 상태 변경
-    current_drive = disk;
-    fscmd_reset_path();
+    if (strcmp(type, "FAT16") == 0 || strcmp(type, "FAT32") == 0) {
+        process_t* cur = proc_current();
+        uint32_t uid = cur ? cur->uid : 0u;
+        uint32_t gid = cur ? cur->gid : 0u;
+        fscmd_set_fat_mount_policy(uid, gid, FSCMD_MODE_OWNER_RW);
+    }
+
     kprintf("Drive %d mounted successfully as %s.\n", disk, type);
 }
 
@@ -932,64 +884,6 @@ void cmd_df() {
 
     kprintf("%d#     %2u%%      %2u%%    [%s]\n",
             current_drive, free_pct, used_pct, type);
-}
-//font
-bool command_font(const char* path) {
-    if (!path || *path == '\0') {
-        kprint("Usage: font <psf2 file>\n");
-        return false;
-    }
-
-    path = strip_quotes(path);
-
-    if (*path == '\0') {
-        kprint("Usage: font <psf2 file>\n");
-        return false;
-    }
-
-    if (strcasecmp(path, "def") == 0 ||
-        strcasecmp(path, "default") == 0) {
-        font_reset_default();
-        kprint("font: reset to default VGA font\n");
-        return true;
-    }
-
-    char fullpath[256];
-    normalize_path(fullpath, current_path, path);
-
-    uint32_t size = fscmd_get_file_size(fullpath);
-    if (size == 0 || size > 65536) {
-        kprint("font: invalid size or file not found\n");
-        return false;
-    }
-
-    uint8_t* buf = kmalloc(size, 0, NULL);
-    if (!buf) {
-        kprint("font: out of memory\n");
-        return false;
-    }
-
-    int read = fscmd_read_file_by_name(fullpath, buf, size);
-    if (read < 0 || (uint32_t)read < size) {
-        kprint("font: failed to read file\n");
-        kfree(buf);
-        return false;
-    }
-
-    char errmsg[64] = {0};
-    bool ok = font_load_psf(buf, size, errmsg, sizeof(errmsg));
-    kfree(buf);
-
-    if (!ok) {
-        kprintf("font: load failed (%s)\n",
-                errmsg[0] ? errmsg : "unknown error");
-    } else if (errmsg[0]) {
-        kprintf("font: loaded with note (%s)\n", errmsg);
-    } else {
-        kprint("font: loaded\n");
-    }
-
-    return ok;
 }
 //dw
 bool cmd_disk_write(const char* args) {
@@ -1824,6 +1718,10 @@ static const char* proc_state_name(proc_state_t state) {
             return "ready";
         case PROC_RUNNING:
             return "running";
+        case PROC_BLOCKED:
+            return "blocked";
+        case PROC_ZOMBIE:
+            return "zombie";
         case PROC_EXITED:
             return "exited";
         case PROC_UNUSED:
@@ -2010,8 +1908,8 @@ static bool dispatch_fg(const char *orig_cmd, char *cmd, bool *out_success) {
 
     if (!proc_make_current(p, NULL)) {
         kprint("fg: failed to switch task\n");
-        keyboard_input_enabled = true;
-        prompt_enabled = true;
+        keyboard_input_enabled = enable_shell;
+        prompt_enabled = enable_shell;
         shell_suspended = false;
         *out_success = false;
         return true;
@@ -2022,11 +1920,11 @@ static bool dispatch_fg(const char *orig_cmd, char *cmd, bool *out_success) {
     return true;
 }
 
-static bool dispatch_fl(const char *orig_cmd, char *cmd, bool *out_success) {
-    if (!(strncmp(cmd, "fl", 2) == 0 && (cmd[2] == '\0' || cmd[2] == ' ')))
+static bool dispatch_dir(const char *orig_cmd, char *cmd, bool *out_success) {
+    if (!(strncmp(cmd, "dir", 3) == 0 && (cmd[3] == '\0' || cmd[3] == ' ')))
         return false;
 
-    const char* args = orig_cmd + 2;
+    const char* args = orig_cmd + 3;
     while (*args == ' ') args++;
 
     // fl  (no args)
@@ -2054,12 +1952,12 @@ static bool dispatch_fl(const char *orig_cmd, char *cmd, bool *out_success) {
     return true;
 }
 
-static bool dispatch_vf(const char *orig_cmd, char *cmd, bool *out_success) {
+static bool dispatch_view(const char *orig_cmd, char *cmd, bool *out_success) {
     (void)orig_cmd;
-    if (strncmp(cmd, "vf ", 3) != 0)
+    if (strncmp(cmd, "view ", 5) != 0)
         return false;
 
-    const char* filename = strip_quotes(cmd + 3);
+    const char* filename = strip_quotes(cmd + 5);
     fscmd_cat(filename);
     *out_success = true;
     return true;
@@ -2106,7 +2004,7 @@ static bool dispatch_run(const char *orig_cmd, char *cmd, bool *out_success) {
     const char* runfile = strip_quotes(cmd + 4);
     prompt_enabled = false;
     run_script(runfile);
-    prompt_enabled = true;
+    prompt_enabled = enable_shell;
     *out_success = true;
     return true;
 }
@@ -2198,8 +2096,8 @@ static bool dispatch_help(const char *orig_cmd, char *cmd, bool *out_success) {
     kprint("  help                 - Show this help message\n");
     kprint("  stop                 - Halt the CPU\n");
     kprint("  page                 - Test kmalloc and paging\n");
-    kprint("  fl                   - List files in current directory\n");
-    kprint("  vf <file>            - View contents of file\n");
+    kprint("  dir                  - List files in current directory\n");
+    kprint("  view <file>            - View contents of file\n");
     kprint("  echo <msg> > f       - Write text to file\n");
     kprint("  echo <msg>           - print text\n");
     kprint("  del <file>           - Delete file\n");
@@ -2219,12 +2117,11 @@ static bool dispatch_help(const char *orig_cmd, char *cmd, bool *out_success) {
     kprint("  note <file>          - Edit or view text file\n");
     kprint("  run <script>         - Run a script file\n");
     pause();
-    kprint("  sh                   - Switch to user shell (/cmd/shell.sys)\n");
-    kprint("  gui                  - Launch GUI shell (/cmd/gui.sys)\n");
+    kprint("  sh                   - Switch to user shell (/cmd/shell)\n");
+    kprint("  gui                  - Launch GUI shell (/cmd/gui)\n");
     kprint("  bin <file> [args...] [&] - Run BIN/ELF (background if &)\n");
     kprint("  hex <file>           - Hex dump file contents\n");
     kprint("  wait <sec>           - Sleep for given seconds\n");
-    kprint("  font <file>          - Load PSF font (PSF1/PSF2), 'font def' to reset\n");
     kprint("  color <fg> <bg>      - Change text color\n");
     kprint("  uptime               - Show the uptime\n");
     kprint("  time                 - Show the current time(KST)\n");
@@ -2242,6 +2139,9 @@ static bool dispatch_help(const char *orig_cmd, char *cmd, bool *out_success) {
     kprint("  df                   - Show disk free space\n");
     kprint("  disk                 - mount disk\n");
     kprint("  disk ls              - list disk\n");
+    kprint("  mount -l             - list mounts\n");
+    kprint("  mount SRC TARGET     - mount source to target\n");
+    kprint("  umount TARGET        - unmount target\n");
     kprint("  diskscan             - Rescan disk drives\n");
     kprint("  usbscan              - Rescan USB ports\n");
     kprint("  svrd <drive#>/<file> - Save ramdisk image to file\n");
@@ -2565,7 +2465,7 @@ static bool dispatch_gui(const char *orig_cmd, char *cmd, bool *out_success) {
         return false;
     }
 
-    const char* argv[] = {"/cmd/gui.sys"};
+    const char* argv[] = {"/cmd/gui"};
     if (!sysmgr_request_exec(argv[0], argv, 1, false)) {
         kprint("gui: busy\n");
         *out_success = false;
@@ -2700,17 +2600,6 @@ static bool dispatch_cp(const char *orig_cmd, char *cmd, bool *out_success) {
     return true;
 }
 
-static bool dispatch_font(const char *orig_cmd, char *cmd, bool *out_success) {
-    (void)orig_cmd;
-    if (strncmp(cmd, "font ", 5) != 0)
-        return false;
-
-    const char* font_file = strip_quotes(cmd + 5);
-    command_font(font_file);
-    *out_success = true;
-    return true;
-}
-
 static bool dispatch_hangul(const char *orig_cmd, char *cmd, bool *out_success) {
     (void)orig_cmd;
     if (strcmp(cmd, "hangul") != 0)
@@ -2740,15 +2629,199 @@ static bool dispatch_disk(const char *orig_cmd, char *cmd, bool *out_success) {
     return true;
 }
 
+static bool parse_mount_source(const char* src, fs_type_t* out_fs, int* out_drive) {
+    if (!src || !out_fs || !out_drive) {
+        return false;
+    }
+
+    if (strcmp(src, "devfs") == 0) {
+        *out_fs = FS_DEVFS;
+        *out_drive = -1;
+        return true;
+    }
+
+    if (strncmp(src, "/dev/", 5) == 0) {
+        uint8_t node_type = 0;
+        uint16_t major = 0;
+        uint16_t minor = 0;
+        if (!devfs_lookup(src, &node_type, &major, &minor)) {
+            return false;
+        }
+        if (node_type != DEV_NODE_BLOCK) {
+            return false;
+        }
+        if (!(major == 8u || major == 9u || major == 10u || major == 11u || major == 12u)) {
+            return false;
+        }
+        if (minor >= MAX_DISKS) {
+            return false;
+        }
+        *out_fs = FS_NONE;
+        *out_drive = (int)minor;
+        return true;
+    }
+
+    const char* p = src;
+    int drive = 0;
+    int digits = 0;
+    while (*p >= '0' && *p <= '9') {
+        drive = drive * 10 + (*p - '0');
+        p++;
+        digits++;
+    }
+    if (digits == 0) {
+        return false;
+    }
+    if (*p == '#') {
+        p++;
+    }
+    if (*p != '\0') {
+        return false;
+    }
+    if (drive < 0 || drive >= MAX_DISKS) {
+        return false;
+    }
+    *out_fs = FS_NONE;
+    *out_drive = drive;
+    return true;
+}
+
+static bool dispatch_mount(const char *orig_cmd, char *cmd, bool *out_success) {
+    (void)orig_cmd;
+    if (!(strcmp(cmd, "mount") == 0 || strncmp(cmd, "mount ", 6) == 0))
+        return false;
+
+    char* args = cmd + 5;
+    while (*args == ' ') args++;
+
+    if (*args == '\0' || strcmp(args, "-l") == 0) {
+        fscmd_mount_info_t mounts[8];
+        int n = fscmd_list_mounts(mounts, 8);
+        if (n <= 0) {
+            kprint("(no mounts)\n");
+            *out_success = true;
+            return true;
+        }
+        for (int i = 0; i < n; i++) {
+            if (mounts[i].fs == FS_DEVFS) {
+                kprintf("devfs on %s type %s\n",
+                        mounts[i].target,
+                        fs_to_string(mounts[i].fs));
+            } else {
+                kprintf("%d# on %s type %s\n",
+                        mounts[i].drive,
+                        mounts[i].target,
+                        fs_to_string(mounts[i].fs));
+            }
+        }
+        *out_success = true;
+        return true;
+    }
+
+    char src[64];
+    char target[64];
+    src[0] = '\0';
+    target[0] = '\0';
+    const char* sp = args;
+    int si = 0;
+    while (*sp && *sp != ' ' && si < (int)sizeof(src) - 1) {
+        src[si++] = *sp++;
+    }
+    src[si] = '\0';
+    while (*sp == ' ') sp++;
+    int ti = 0;
+    while (*sp && *sp != ' ' && ti < (int)sizeof(target) - 1) {
+        target[ti++] = *sp++;
+    }
+    target[ti] = '\0';
+    while (*sp == ' ') sp++;
+
+    if (src[0] == '\0' || target[0] == '\0' || *sp != '\0') {
+        kprint("Usage: mount -l | mount <drive#|/dev/node|devfs> <target>\n");
+        *out_success = false;
+        return true;
+    }
+
+    fs_type_t mount_fs = FS_NONE;
+    int drive = -1;
+    if (!parse_mount_source(src, &mount_fs, &drive)) {
+        kprintf("mount: invalid source: %s\n", src);
+        *out_success = false;
+        return true;
+    }
+    if (mount_fs == FS_DEVFS) {
+        char target_abs[256];
+        normalize_path(target_abs, current_path, target);
+        if (!fscmd_mount_devfs_at(target_abs)) {
+            kprintf("mount: failed (devfs -> %s)\n", target_abs);
+            *out_success = false;
+            return true;
+        }
+        kprintf("mounted devfs on %s (%s)\n", target_abs, fs_to_string(FS_DEVFS));
+        *out_success = true;
+        return true;
+    }
+
+    if (!m_disk_exists(drive)) {
+        kprintf("mount: drive %d not detected\n", drive);
+        *out_success = false;
+        return true;
+    }
+
+    if (strcmp(disks[drive].fs_type, "Unknown") == 0 || strcmp(disks[drive].fs_type, "MBR") == 0) {
+        refresh_disk_kind(drive);
+    }
+
+    char target_abs[256];
+    normalize_path(target_abs, current_path, target);
+
+    if (!fscmd_mount_drive_at(drive, target_abs)) {
+        kprintf("mount: failed (%d# -> %s)\n", drive, target_abs);
+        *out_success = false;
+        return true;
+    }
+
+    if (strcmp(disks[drive].fs_type, "FAT16") == 0 || strcmp(disks[drive].fs_type, "FAT32") == 0) {
+        process_t* cur = proc_current();
+        uint32_t uid = cur ? cur->uid : 0u;
+        uint32_t gid = cur ? cur->gid : 0u;
+        fscmd_set_fat_mount_policy(uid, gid, FSCMD_MODE_OWNER_RW);
+    }
+
+    kprintf("mounted %d# on %s (%s)\n", drive, target_abs, disks[drive].fs_type);
+    *out_success = true;
+    return true;
+}
+
+static bool dispatch_umount(const char *orig_cmd, char *cmd, bool *out_success) {
+    (void)orig_cmd;
+    if (strncmp(cmd, "umount ", 7) != 0)
+        return false;
+
+    const char* target = strip_quotes(cmd + 7);
+    if (!target || *target == '\0') {
+        kprint("Usage: umount <target>\n");
+        *out_success = false;
+        return true;
+    }
+    char target_abs[256];
+    normalize_path(target_abs, current_path, target);
+    if (!fscmd_unmount(target_abs)) {
+        kprintf("umount: failed: %s\n", target_abs);
+        *out_success = false;
+        return true;
+    }
+    kprintf("unmounted %s\n", target_abs);
+    *out_success = true;
+    return true;
+}
+
 static bool dispatch_cwd(const char *orig_cmd, char *cmd, bool *out_success) {
     (void)orig_cmd;
     if (strcmp(cmd, "cwd") != 0)
         return false;
 
-    if (current_drive < 0)
-        kprint("#\n");                // 아무 드라이브도 선택 안 된 상태
-    else
-        kprintf("%d#%s\n", current_drive, current_path);  // 표시할 때만 0#/ 형식
+    kprintf("%s\n", current_path);
     *out_success = true;
     return true;
 }
@@ -2837,9 +2910,7 @@ static bool dispatch_usbscan(const char *orig_cmd, char *cmd, bool *out_success)
 
     if (current_drive >= USB_DRIVE_BASE) {
         kprint("[USB] unmounting current USB filesystem...\n");
-        current_drive = -1;
-        current_fs = FS_NONE;
-        fscmd_reset_path();
+        fs_unmount_all();
     }
 
     (void)ehci_take_rescan_pending();
@@ -2998,9 +3069,6 @@ static bool dispatch_format(const char *orig_cmd, char *cmd, bool *out_success) 
 }
 
 bool execute_single_command(const char *orig_cmd, char *cmd) {
-    if (enable_shell == false)
-        return false;
-
     bool success = true;
     static const cmd_entry cmd_table[] = {
         {dispatch_stop},
@@ -3009,8 +3077,8 @@ bool execute_single_command(const char *orig_cmd, char *cmd) {
         {dispatch_ps},
         {dispatch_kill},
         {dispatch_fg},
-        {dispatch_fl},
-        {dispatch_vf},
+        {dispatch_dir},
+        {dispatch_view},
         {dispatch_set},
         {dispatch_assign},
         {dispatch_echo_star},
@@ -3040,9 +3108,10 @@ bool execute_single_command(const char *orig_cmd, char *cmd) {
         {dispatch_hex},
         {dispatch_mv},
         {dispatch_cp},
-        {dispatch_font},
         {dispatch_hangul},
         {dispatch_disk},
+        {dispatch_mount},
+        {dispatch_umount},
         {dispatch_cwd},
         {dispatch_uptime},
         {dispatch_time},
@@ -3067,10 +3136,10 @@ bool execute_single_command(const char *orig_cmd, char *cmd) {
     while (*p == ' ' || *p == '\t') p++;  // 앞쪽 공백 스킵
 
     if (*p != '\0') {
-        // 공백만이 아니라면 "Command not found" 출력
+        // 공백만이 아니라면 "<cmd>: command not found" 출력
         const char* shown = (orig_cmd && *orig_cmd) ? orig_cmd : cmd;
         kprint(shown);
-        kprint(" = Command not found\n");
+        kprint(": command not found\n");
     }
     return false;
 }

@@ -1,12 +1,19 @@
-This project is dual-licensed.
+orionOS Project License Notice
+===============================
 
-You may use, modify, and distribute this software
-under the terms of either:
+This project contains multiple components under different licenses.
 
-1. The Open Practical License (OPL) v1.1
-   (see LICENSES/LICENSE.OPL)
-OR
-2. The BSD 3-Clause License
-   (see LICENSES/LICENSE.BSD)
+Main project:
+  - orionOS
+    License: See LICENSES/LICENSE.orionOS
 
-You may choose either license at your option.
+Third-party components:
+  - Limine Bootloader
+    License: See LICENSES/LICENSE.limine
+
+  - os-tutorial code
+    License: See LICENSES/LICENSE.os-tutorial
+
+Each component retains its original license.
+Please refer to the respective files in the LICENSES directory
+for full license texts.

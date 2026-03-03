@@ -1,4 +1,4 @@
-[bits 32]
+[bits 64]
 global tss_flush
 
 tss_flush:

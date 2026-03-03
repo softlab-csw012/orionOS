@@ -6,6 +6,10 @@
 #include "../mm/mem.h"
 #include "../libc/function.h"
 #include "../kernel/kernel.h"
+#include "../kernel/tty.h"
+#include "../kernel/input_queue.h"
+#include "../kernel/io/console_lock.h"
+#include "../kernel/ipc/gui_ipc.h"
 #include "../kernel/proc/proc.h"
 #include "../kernel/log.h"
 #include "../cpu/timer.h"
@@ -25,10 +29,14 @@
 #define CTRL_BREAK 0x9D
 
 #define KBD_E0_PREFIX   0xE0
+#define KBD_F0_PREFIX   0xF0
 #define KEY_LEFT_MAKE   0x4B
 #define KEY_RIGHT_MAKE  0x4D
 #define KEY_UP_MAKE     0x48
 #define KEY_DOWN_MAKE   0x50
+#define KEY_HOME_MAKE   0x47
+#define KEY_END_MAKE    0x4F
+#define KEY_DELETE_MAKE 0x53
 #define ESCAPE          0x01
 
 #define MAX_LINE     256
@@ -38,6 +46,10 @@
 #define NUMLOCK_BREAK   0xC5
 #define KEY_PGUP_MAKE   0x49
 #define KEY_PGDN_MAKE   0x51
+#define KEY_F1_MAKE     0x3B
+#define KEY_F2_MAKE     0x3C
+#define KEY_F3_MAKE     0x3D
+#define KEY_F4_MAKE     0x3E
 
 // ──────────────────────────────────────────────
 // 전역 상태
@@ -57,10 +69,12 @@ static char edit_scratch[MAX_LINE];
 static int saved_edit = 0;
 
 static int  kbd_e0 = 0;
+static int  kbd_f0 = 0;
 static bool shift_pressed = false;
 static bool capslock_on = false;
 static bool alt_left_pressed = false;
 static bool alt_right_pressed = false;
+static bool alt_right_toggle_candidate = false;
 static bool numlock_on = false;
 static bool scrolllock_on = false;
 static bool ctrl_pressed = false;
@@ -69,50 +83,130 @@ static bool ctrl_pressed = false;
 volatile bool g_key_pressed = false;
 volatile uint8_t last_ascii = 0;
 
-// note 모드 키 입력 버퍼
-#define NOTE_KEYBUF_SIZE 128u
-#define NOTE_KEYBUF_MASK (NOTE_KEYBUF_SIZE - 1u)
-static volatile uint8_t note_keybuf[NOTE_KEYBUF_SIZE];
-static volatile uint32_t note_keybuf_head = 0;
-static volatile uint32_t note_keybuf_tail = 0;
-
 static inline void note_keybuf_clear_unsafe(void) {
-    note_keybuf_head = 0;
-    note_keybuf_tail = 0;
+    input_queue_clear();
     g_key_pressed = false;
     last_ascii = 0;
 }
 
-static inline void note_key_emit(uint8_t code) {
-    uint32_t next = (note_keybuf_head + 1u) & NOTE_KEYBUF_MASK;
-    if (next == note_keybuf_tail) {
-        note_keybuf_tail = (note_keybuf_tail + 1u) & NOTE_KEYBUF_MASK;
+static input_event_t keyboard_make_input_event(uint8_t code) {
+    input_event_t event = {
+        .code = code,
+        .modifiers = 0,
+        .toggles = 0,
+        .reserved = 0,
+    };
+    if (shift_pressed) {
+        event.modifiers |= INPUT_MOD_SHIFT;
     }
-    note_keybuf[note_keybuf_head] = code;
-    note_keybuf_head = next;
+    if (ctrl_pressed) {
+        event.modifiers |= INPUT_MOD_CTRL;
+    }
+    if (alt_left_pressed || alt_right_pressed) {
+        event.modifiers |= INPUT_MOD_ALT;
+    }
+    if (capslock_on) {
+        event.toggles |= INPUT_TOGGLE_CAPS;
+    }
+    if (numlock_on) {
+        event.toggles |= INPUT_TOGGLE_NUM;
+    }
+    if (scrolllock_on) {
+        event.toggles |= INPUT_TOGGLE_SCROLL;
+    }
+    if (keyboard_korean_ime_enabled) {
+        event.toggles |= INPUT_TOGGLE_KOREAN;
+    }
+    return event;
+}
+
+static inline void note_key_emit(uint8_t code) {
+    input_event_t event = keyboard_make_input_event(code);
+    input_queue_push_event(&event);
     last_ascii = code;
     g_key_pressed = true;
 }
 
 static bool note_keybuf_pop(uint8_t* out) {
-    bool ok = false;
-    hal_disable_interrupts();
-    if (note_keybuf_head != note_keybuf_tail) {
-        *out = note_keybuf[note_keybuf_tail];
-        note_keybuf_tail = (note_keybuf_tail + 1u) & NOTE_KEYBUF_MASK;
-        ok = true;
+    bool ok = input_queue_pop(out);
+    g_key_pressed = input_queue_has_data();
+    if (!g_key_pressed)
+        last_ascii = 0;
+    return ok;
+}
+
+static bool note_keybuf_pop_event(input_event_t* out) {
+    bool ok = input_queue_pop_event(out);
+    g_key_pressed = input_queue_has_data();
+    if (!g_key_pressed) {
+        last_ascii = 0;
+    } else if (ok) {
+        last_ascii = out->code;
     }
-    g_key_pressed = (note_keybuf_head != note_keybuf_tail);
-    if (!g_key_pressed) last_ascii = 0;
-    hal_enable_interrupts();
     return ok;
 }
 
 static volatile bool ignore_ps2_scancodes = false;
 
+static bool has_name_suffix(const char* name, const char* suffix) {
+    if (!name || !suffix) {
+        return false;
+    }
+    size_t nlen = strlen(name);
+    size_t slen = strlen(suffix);
+    if (nlen < slen) {
+        return false;
+    }
+    return strcasecmp(name + (nlen - slen), suffix) == 0;
+}
+
+static bool keyboard_should_scroll_history(void) {
+    if (keyboard_input_enabled) {
+        return true;
+    }
+    process_t* fg = proc_lookup(tty_get_foreground());
+    if (!fg) {
+        return false;
+    }
+    return has_name_suffix(fg->name, "shell") || has_name_suffix(fg->name, "login");
+}
+
 // 모드 전환 플래그 (true = shell, false = note),  스크립트 종료 플래그
 bool keyboard_input_enabled = false; // 모드 전환 플래그
+bool keyboard_korean_ime_enabled = false;
 volatile int g_break_script = 0; // 스크립트 종료 플래그 
+static volatile bool kbd_led_update_pending = false;
+
+static bool keyboard_post_alt_tab_event(bool reverse) {
+    uint32_t gui_pid = gui_ipc_server_pid_get();
+    if (gui_pid == 0) {
+        return false;
+    }
+    gui_ipc_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = GUI_MSG_SYS_ALT_TAB;
+    msg.a = reverse ? 1 : 0;
+    uint32_t flags = console_lock_acquire();
+    bool ok = gui_ipc_queue_push(&msg);
+    console_lock_release(flags);
+    return ok;
+}
+
+static bool keyboard_should_use_korean_ime(void) {
+    if (!keyboard_korean_ime_enabled || keyboard_input_enabled) {
+        return false;
+    }
+    process_t* fg = proc_lookup(tty_get_foreground());
+    if (!fg) {
+        return false;
+    }
+    return has_name_suffix(fg->name, "shell") || has_name_suffix(fg->name, "login");
+}
+
+static bool keyboard_is_korean_shift_key(char ch) {
+    return ch == 'q' || ch == 'w' || ch == 'e' || ch == 'r' ||
+           ch == 't' || ch == 'o' || ch == 'p';
+}
 
 extern int  get_cursor_row(void);
 extern int  get_cursor_col(void);
@@ -121,38 +215,48 @@ extern void set_cursor(int row, int col);
 // ──────────────────────────────────────────────
 // PS/2 컨트롤러 유틸 (LED 동기화용)
 // ──────────────────────────────────────────────
-static inline void ps2_wait_write(void) {
+static bool ps2_wait_write(void) {
     for (int i = 0; i < 100000; i++) {
-        uint8_t st = hal_in8(0x64);
-        if ((st & 0x02) == 0) break;
+        if (!(hal_in8(0x64) & 0x02))
+            return true;
     }
+    return false; // 아직 busy
 }
-static inline void ps2_wait_read(void) {
+static bool ps2_wait_read(void) {
     for (int i = 0; i < 100000; i++) {
-        uint8_t st = hal_in8(0x64);
-        if (st & 0x01) break;
+        if (hal_in8(0x64) & 0x01)
+            return true;
     }
+    return false; // 데이터 없음
 }
-static inline void kbd_write(uint8_t val) {
-    ps2_wait_write();
+static bool kbd_write(uint8_t val) {
+    if (!ps2_wait_write())
+        return false;
     hal_out8(0x60, val);
+    return true;
 }
-static inline uint8_t kbd_read(void) {
-    ps2_wait_read();
-    return hal_in8(0x60);
+static bool kbd_read(uint8_t* out) {
+    if (!ps2_wait_read())
+        return false;
+    *out = hal_in8(0x60);
+    return true;
 }
 
 // ★ 정식 LED 세팅 (ACK까지 확인)
 void kbd_set_leds(bool caps, bool num, bool scroll) {
     uint8_t val = (scroll ? 1 : 0) | (num ? 2 : 0) | (caps ? 4 : 0);
+    uint8_t ack;
 
-    // Step 1: LED 명령 전송
-    kbd_write(0xED);
-    if (kbd_read() != 0xFA) return;   // ACK 실패 시 무시
+    // Step 1: LED 명령
+    if (!kbd_write(0xED))
+        return;
+    if (!kbd_read(&ack) || ack != 0xFA)
+        return;
 
-    // Step 2: LED 값 전송
-    kbd_write(val);
-    (void)kbd_read();                 // 최종 ACK 소비
+    // Step 2: LED 값
+    if (!kbd_write(val))
+        return;
+    (void)kbd_read(&ack); // 마지막 ACK 소비
 }
 
 // shift, alt, E0 플래그만 리셋
@@ -160,7 +264,9 @@ void reset_modifiers(void) {
     shift_pressed     = false;
     alt_left_pressed  = false;
     alt_right_pressed = false;
+    alt_right_toggle_candidate = false;
     kbd_e0            = 0;
+    kbd_f0            = 0;
     // capslock_on, numlock_on, scrolllock_on 은 유지
 }
 
@@ -276,21 +382,66 @@ static void keyboard_handle_scancode(uint8_t sc) {
     char base = 0;
 
     if (sc == KBD_E0_PREFIX) { kbd_e0 = 1; goto done; }
+    if (sc == KBD_F0_PREFIX) { kbd_f0 = 1; goto done; }
+
+    if (kbd_f0) {
+        if (kbd_e0) {
+            if (sc == 0x11) {
+                alt_right_pressed = false;
+                alt_right_toggle_candidate = false;
+            } else if (sc == 0x14) {
+                ctrl_pressed = false;
+            }
+            kbd_e0 = 0;
+            kbd_f0 = 0;
+            goto done;
+        }
+
+        if (sc == 0x12 || sc == 0x59) {
+            shift_pressed = false;
+        } else if (sc == 0x11) {
+            alt_left_pressed = false;
+        } else if (sc == 0x14) {
+            ctrl_pressed = false;
+        }
+        kbd_f0 = 0;
+        goto done;
+    }
 
     if (sc & 0x80) {
         if (kbd_e0) {
-            if (sc == ALT_BREAK) alt_right_pressed = false;
+            if (sc == ALT_BREAK) {
+                alt_right_pressed = false;
+                if (alt_right_toggle_candidate) {
+                    keyboard_korean_ime_enabled = !keyboard_korean_ime_enabled;
+                }
+                alt_right_toggle_candidate = false;
+            }
             kbd_e0 = 0;
             goto done;
         }
+        if (sc == CTRL_BREAK)  ctrl_pressed = false;
         if (sc == ALT_BREAK) alt_left_pressed = false;
         if (sc == LSHIFT_BREAK || sc == RSHIFT_BREAK) shift_pressed = false;
         goto done;
     }
 
     if (sc == ALT_MAKE) { 
-        if (kbd_e0) alt_right_pressed = true;
-        else        alt_left_pressed = true;
+        if (kbd_e0) {
+            keyboard_korean_ime_enabled = !keyboard_korean_ime_enabled;
+            alt_right_pressed = false;
+            alt_right_toggle_candidate = false;
+            kbd_e0 = 0;
+        } else {
+            alt_left_pressed = true;
+        }
+        goto done;
+    }
+    if (alt_right_pressed) alt_right_toggle_candidate = false;
+    if ((alt_left_pressed || alt_right_pressed) &&
+        (sc == KEY_F1_MAKE || sc == KEY_F2_MAKE || sc == KEY_F3_MAKE || sc == KEY_F4_MAKE)) {
+        tty_request_vc_switch((uint8_t)(sc - KEY_F1_MAKE));
+        reset_modifiers();
         goto done;
     }
     if (sc == LSHIFT_MAKE || sc == RSHIFT_MAKE) { shift_pressed = true; goto done; }
@@ -298,14 +449,14 @@ static void keyboard_handle_scancode(uint8_t sc) {
     // CAPSLOCK 이벤트 처리
     if (sc == CAPSLOCK) {
         capslock_on = !capslock_on;
-        kbd_set_leds(capslock_on, numlock_on, scrolllock_on);
+        kbd_led_update_pending = true;
         goto done;
     }
 
     // NUMLOCK 이벤트 처리
     if (sc == NUMLOCK_MAKE) {
         numlock_on = !numlock_on;
-        kbd_set_leds(capslock_on, numlock_on, scrolllock_on);
+        kbd_led_update_pending = true;
         goto done;
     }
 
@@ -313,13 +464,13 @@ static void keyboard_handle_scancode(uint8_t sc) {
     if (sc == CTRL_MAKE) { ctrl_pressed = true; goto done; }
     if (sc == CTRL_BREAK) { ctrl_pressed = false; goto done; }
 
+    if (sc == 0x0F && (alt_left_pressed || alt_right_pressed)) {
+        (void)keyboard_post_alt_tab_event(shift_pressed);
+        goto done;
+    }
+
     if (ctrl_pressed && sc == 0x12) {
-        uint32_t fg_pid = proc_get_foreground_pid();
-        if (fg_pid) {
-            (void)proc_kill(fg_pid, false);
-        } else if (proc_current_is_user()) {
-            proc_request_kill();
-        } else {
+        if (!tty_signal_int()) {
             g_break_script = 1;
         }
         ctrl_pressed = false;
@@ -398,6 +549,11 @@ static void keyboard_handle_scancode(uint8_t sc) {
             if (sc == KEY_RIGHT_MAKE) { note_key_emit(NOTE_KEY_RIGHT); reset_modifiers(); }
             if (sc == KEY_UP_MAKE)    { note_key_emit(NOTE_KEY_UP);    reset_modifiers(); }
             if (sc == KEY_DOWN_MAKE)  { note_key_emit(NOTE_KEY_DOWN);  reset_modifiers(); }
+            if (sc == KEY_PGUP_MAKE)  { note_key_emit(NOTE_KEY_PGUP);  reset_modifiers(); }
+            if (sc == KEY_PGDN_MAKE)  { note_key_emit(NOTE_KEY_PGDN);  reset_modifiers(); }
+            if (sc == KEY_HOME_MAKE)  { note_key_emit(NOTE_KEY_HOME);  reset_modifiers(); }
+            if (sc == KEY_END_MAKE)   { note_key_emit(NOTE_KEY_END);   reset_modifiers(); }
+            if (sc == KEY_DELETE_MAKE){ note_key_emit(NOTE_KEY_DEL);   reset_modifiers(); }
         }
 
         kbd_e0 = 0;
@@ -472,11 +628,24 @@ static void keyboard_handle_scancode(uint8_t sc) {
                 if (sc == KEY_RIGHT_MAKE) { note_key_emit(NOTE_KEY_RIGHT); reset_modifiers(); }
                 if (sc == KEY_UP_MAKE)    { note_key_emit(NOTE_KEY_UP);    reset_modifiers(); }
                 if (sc == KEY_DOWN_MAKE)  { note_key_emit(NOTE_KEY_DOWN);  reset_modifiers(); }
+                if (sc == KEY_HOME_MAKE)  { note_key_emit(NOTE_KEY_HOME);  reset_modifiers(); }
+                if (sc == KEY_END_MAKE)   { note_key_emit(NOTE_KEY_END);   reset_modifiers(); }
+                if (sc == KEY_DELETE_MAKE){ note_key_emit(NOTE_KEY_DEL);   reset_modifiers(); }
             }
             goto done;
         }
-        if (sc == KEY_PGUP_MAKE) { scroll_up_screen(); reset_modifiers(); goto done; }
-        if (sc == KEY_PGDN_MAKE) { scroll_down_screen(); reset_modifiers(); goto done; }
+        if (sc == KEY_PGUP_MAKE) {
+            if (keyboard_should_scroll_history()) scroll_up_screen();
+            else note_key_emit(NOTE_KEY_PGUP);
+            reset_modifiers();
+            goto done;
+        }
+        if (sc == KEY_PGDN_MAKE) {
+            if (keyboard_should_scroll_history()) scroll_down_screen();
+            else note_key_emit(NOTE_KEY_PGDN);
+            reset_modifiers();
+            goto done;
+        }
     }
 
     if (sc > SC_MAX) goto done;
@@ -489,7 +658,13 @@ static void keyboard_handle_scancode(uint8_t sc) {
     else {
         base = sc_ascii[sc];
         if (base >= 'a' && base <= 'z') {
-            if (shift_pressed ^ capslock_on) base = (char)(base - 'a' + 'A');
+            if (keyboard_should_use_korean_ime()) {
+                if (shift_pressed && keyboard_is_korean_shift_key(base)) {
+                    base = (char)(base - 'a' + 'A');
+                }
+            } else if (shift_pressed ^ capslock_on) {
+                base = (char)(base - 'a' + 'A');
+            }
         } else {
             if (shift_pressed) base = sc_ascii_shift[sc];
         }
@@ -497,6 +672,8 @@ static void keyboard_handle_scancode(uint8_t sc) {
 
 insert_char:
     if (base != 0) {
+        bool korean_ime_key = keyboard_should_use_korean_ime() &&
+                              ((base >= 'a' && base <= 'z') || (base >= 'A' && base <= 'Z'));
         if (keyboard_input_enabled) {
             if (in_len < MAX_LINE - 1) {
                 memmove(&key_buffer[cur_ix + 1], &key_buffer[cur_ix], in_len - cur_ix);
@@ -506,7 +683,20 @@ insert_char:
                 redraw_line();
             }
         } else {
-            note_key_emit((uint8_t)base);
+            if (ctrl_pressed && ((base >= 'a' && base <= 'z') || (base >= 'A' && base <= 'Z'))) {
+                uint8_t ctrl_code = (uint8_t)(base & 0x1F);
+                if (shift_pressed) {
+                    note_key_emit((uint8_t)(0xA0u | ctrl_code));
+                } else {
+                    note_key_emit(ctrl_code);
+                }
+                reset_modifiers();
+            } else {
+                note_key_emit((uint8_t)base);
+            }
+        }
+        if (korean_ime_key) {
+            shift_pressed = false;
         }
     }
 
@@ -516,11 +706,16 @@ done:
 
 static void keyboard_callback(registers_t* regs) {
     uint8_t sc = hal_in8(0x60);
-    if (ignore_ps2_scancodes) {
+
+    // ----- PS/2 응답 바이트 필터 -----
+    if (sc == 0xFA || sc == 0xFE || sc == 0xEE) {
         UNUSED(regs);
-        return;
+        return; // ACK/RESEND/SELFTEST → 소비만 하고 무시
     }
-    keyboard_handle_scancode(sc);
+
+    if (!ignore_ps2_scancodes)
+        keyboard_handle_scancode(sc);
+
     UNUSED(regs);
 }
 
@@ -542,9 +737,10 @@ void allow_all_irqs() {
 
 static void wait_for_note_key(void) {
     hal_enable_interrupts();
-    while (!g_key_pressed) {
+    while (!input_queue_has_data()) {
         hal_halt();
     }
+    g_key_pressed = true;
 }
 
 void keyboard_note_debounce(void) {
@@ -576,7 +772,8 @@ void wait_for_keypress() {
         hal_enable_interrupts();
     }
 
-    while (!g_key_pressed) hal_halt();
+    while (!input_queue_has_data()) hal_halt();
+    g_key_pressed = true;
     allow_all_irqs();
 }
 
@@ -599,6 +796,29 @@ int getkey_nonblock(void) {
     return (int)c;
 }
 
+int getkey_event(input_event_t* event) {
+    if (!event) {
+        return 0;
+    }
+    do {
+        if (!note_keybuf_pop_event(event)) {
+            wait_for_note_key();
+            continue;
+        }
+    } while (event->code == 0);
+    return 1;
+}
+
+int getkey_event_nonblock(input_event_t* event) {
+    if (!event) {
+        return 0;
+    }
+    if (!note_keybuf_pop_event(event)) {
+        return 0;
+    }
+    return event->code != 0 ? 1 : 0;
+}
+
 void keyboard_flush(void) {
     hal_disable_interrupts();
     note_keybuf_clear_unsafe();
@@ -614,6 +834,20 @@ void keyboard_set_ignore_ps2(bool ignore) {
     ignore_ps2_scancodes = ignore;
 }
 
+uint32_t keyboard_get_modifiers(void) {
+    uint32_t mods = 0;
+    if (shift_pressed) {
+        mods |= KEYBOARD_MOD_SHIFT;
+    }
+    if (ctrl_pressed) {
+        mods |= KEYBOARD_MOD_CTRL;
+    }
+    if (alt_left_pressed || alt_right_pressed) {
+        mods |= KEYBOARD_MOD_ALT;
+    }
+    return mods;
+}
+
 static inline void kbd_wait_input() {
     while (hal_in8(0x64) & 0x02);
 }
@@ -622,44 +856,52 @@ static inline void kbd_wait_output() {
     while (!(hal_in8(0x64) & 0x01));
 }
 
+static inline void kbd_drain_output(void) {
+    while (hal_in8(0x64) & 0x01) {
+        (void)hal_in8(0x60);
+    }
+}
+
 void init_keyboard() {
-    // 1️⃣ IRQ 핸들러 먼저 등록
+    // IRQ 핸들러 먼저 등록
     register_interrupt_handler(IRQ1, keyboard_callback);
 
-    // 2️⃣ 키보드 포트 비활성화
+    // 키보드 포트 비활성화
     kbd_wait_input();
     hal_out8(0x64, 0xAD);
 
-    // 3️⃣ 출력 버퍼 flush (VBox 필수)
-    while (hal_in8(0x64) & 1)
-        hal_in8(0x60);
+    // 출력 버퍼 flush (VBox 필수)
+    kbd_drain_output();
 
-    // 4️⃣ Command byte 읽기
+    // Command byte 읽기
     kbd_wait_input();
     hal_out8(0x64, 0x20);
     kbd_wait_output();
     uint8_t cmd = hal_in8(0x60);
 
-    // IRQ1 enable
+    // IRQ1 enable.
+    // Keep the controller's native mode and handle VMware's odd Shift
+    // make/break sequences in software. Forcing translation caused
+    // stray PS/2 key events on some VMware setups.
     cmd |= 0x01;
 
-    // 5️⃣ Command byte 쓰기
+    // Command byte 쓰기
     kbd_wait_input();
     hal_out8(0x64, 0x60);
     kbd_wait_input();
     hal_out8(0x60, cmd);
 
-    // 6️⃣ 키보드 enable
+    // 키보드 enable
     kbd_wait_input();
     hal_out8(0x64, 0xAE);
 
-    // 7️⃣ 스캔 활성화 (ACK 반드시 처리)
+    // 스캔 활성화 (ACK 반드시 처리)
     kbd_wait_input();
     hal_out8(0x60, 0xF4);
     kbd_wait_output();
     hal_in8(0x60); // ACK(0xFA)
 
-    // 8️⃣ LED 끄기 (ACK 2번 처리)
+    // LED 끄기 (ACK 2번 처리)
     kbd_wait_input();
     hal_out8(0x60, 0xED);
     kbd_wait_output();
@@ -670,11 +912,17 @@ void init_keyboard() {
     kbd_wait_output();
     hal_in8(0x60); // ACK
 
-    // 9️⃣ modifier 상태 초기화
+    // modifier 상태 초기화
     capslock_on = numlock_on = scrolllock_on = false;
     reset_modifiers();
+    note_keybuf_clear_unsafe();
 
-    // 🔟 마지막에 IRQ1 unmask
+    // Some QEMU/firmware setups leave one translated make code pending
+    // after scan enable/LED sync. Drain it before IRQ1 is unmasked so it
+    // cannot appear as a phantom first key (for example, '2').
+    kbd_drain_output();
+
+    // 마지막에 IRQ1 unmask
     uint8_t mask = hal_in8(0x21);
     mask &= ~(1 << 1);
     hal_out8(0x21, mask);

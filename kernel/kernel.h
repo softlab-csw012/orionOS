@@ -14,6 +14,7 @@ extern bool script_running;
 extern bool ramdisk_auto_mount;
 extern bool shell_suspended;
 
+void kernel_main(uintptr_t boot_magic, uintptr_t boot_info_addr);
 void prompt();
 void user_input(char *input);
 int parse_escapes(const char* src, char* dst, int maxlen);

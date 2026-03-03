@@ -1,6 +1,6 @@
 #include "pci.h"
 #include "hal.h"   // hal_in32/out 필요
-#include "../drivers/screen.h" // kprintf()
+#include "../kernel/io/console.h" // kprintf()
 #include "ac97.h"
 #include "hda.h"
 #include "ahci.h"
@@ -47,10 +47,6 @@ void pci_scan_all_devices(void) {
     } ac97_candidates[AC97_CANDIDATE_MAX];
     int ac97_candidate_count = 0;
 
-    const uint8_t forced_hda_bus = 2;
-    const uint8_t forced_hda_dev = 3;
-    const uint8_t forced_hda_func = 0;
-
     for (int bus = 0; bus < 256; bus++) {
         for (int dev = 0; dev < 32; dev++) {
             for (int func = 0; func < 8; func++) {
@@ -78,12 +74,6 @@ void pci_scan_all_devices(void) {
                 kprintf("       Header: %02X\n", header_type);
 
                 bool attached_hda = false;
-                if ((uint8_t)bus == forced_hda_bus &&
-                    (uint8_t)dev == forced_hda_dev &&
-                    (uint8_t)func == forced_hda_func) {
-                    kprintf("       [HDA Audio Controller Forced]\n");
-                    attached_hda = hda_pci_attach_force((uint8_t)bus, (uint8_t)dev, (uint8_t)func);
-                }
 
                 // ===============================
                 //  IDE Controller 식별

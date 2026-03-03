@@ -17,13 +17,13 @@ static int controller_count = 0;
 static volatile bool ohci_rescan_pending = false;
 #define EFLAGS_IF 0x200u
 
-static uint32_t irq_save(void) {
-    uint32_t flags = 0;
-    __asm__ volatile("pushf; pop %0; cli" : "=r"(flags) :: "memory");
+static uintptr_t irq_save(void) {
+    uintptr_t flags = 0;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     return flags;
 }
 
-static void irq_restore(uint32_t flags) {
+static void irq_restore(uintptr_t flags) {
     if (flags & EFLAGS_IF) {
         __asm__ volatile("sti" ::: "memory");
     }
@@ -38,7 +38,7 @@ static void ohci_rescan_work(void* ctx) {
 
 static void ohci_queue_rescan(void) {
     bool enqueue = false;
-    uint32_t flags = irq_save();
+    uintptr_t flags = irq_save();
     if (!ohci_rescan_pending) {
         ohci_rescan_pending = true;
         enqueue = true;
@@ -138,9 +138,9 @@ struct ohci_async_in {
 
 static inline uint32_t phys_addr(void* p) {
     uint32_t phys;
-    if (vmm_virt_to_phys((uint32_t)p, &phys) == 0)
+    if (vmm_virt_to_phys((uint32_t)(uintptr_t)p, &phys) == 0)
         return phys;
-    return (uint32_t)p;
+    return (uint32_t)(uintptr_t)p;
 }
 
 static inline uint32_t rd_reg(ohci_ctrl_t* hc, uint32_t off) {
@@ -716,7 +716,7 @@ void ohci_pci_attach(uint32_t mmio_base, uint8_t irq_line) {
     ohci_ctrl_t* hc = &controllers[idx];
     memset(hc, 0, sizeof(*hc));
     hc->base = mmio_base;
-    hc->regs = (volatile uint32_t*)mmio_base;
+    hc->regs = (volatile uint32_t*)(uintptr_t)mmio_base;
     hc->irq_line = irq_line;
     hc->next_addr = 1;
     hc->usbhc = &usbhc_wrappers[idx];

@@ -44,8 +44,6 @@ bool m_disk_exists(int drive);
 void normalize_path(char* out, const char* cwd, const char* path);
 //df
 void cmd_df();
-//font
-bool command_font(const char* current_path);
 //dw
 bool cmd_disk_write(const char* args);
 //save

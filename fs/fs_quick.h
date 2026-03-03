@@ -12,6 +12,6 @@ typedef enum {
     FSQ_XVFS
 } fs_kind_t;
 
-bool ata_present(uint8_t drive);              // IDENTIFY로만 판단
+bool blockdev_present(uint8_t drive);              // IDENTIFY로만 판단
 bool disk_has_55aa(uint8_t drive, uint32_t lba);
 fs_kind_t fs_quick_probe(uint8_t drive, uint32_t *out_base_lba); // BPB 파싱X

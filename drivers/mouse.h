@@ -5,15 +5,14 @@
 #include <stdbool.h>
 
 typedef struct {
-    int x;
-    int y;
+    int x; // pixel x when framebuffer is active, cell x otherwise
+    int y; // pixel y when framebuffer is active, cell y otherwise
     int buttons;   // bit0=left, bit1=right, bit2=middle
 } mouse_state_t;
 
 void mouse_init(void);
 void mouse_wait(uint8_t type);
 void mouse_write(uint8_t data);
-uint8_t mouse_read(void);
 void mouse_set_ignore_ps2(bool ignore);
 void mouse_set_draw(bool enable);
 

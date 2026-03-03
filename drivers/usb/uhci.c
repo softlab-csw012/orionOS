@@ -15,13 +15,13 @@ static int controller_count = 0;
 static volatile bool uhci_rescan_pending = false;
 #define EFLAGS_IF 0x200u
 
-static uint32_t irq_save(void) {
-    uint32_t flags = 0;
-    __asm__ volatile("pushf; pop %0; cli" : "=r"(flags) :: "memory");
+static uintptr_t irq_save(void) {
+    uintptr_t flags = 0;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     return flags;
 }
 
-static void irq_restore(uint32_t flags) {
+static void irq_restore(uintptr_t flags) {
     if (flags & EFLAGS_IF) {
         __asm__ volatile("sti" ::: "memory");
     }
@@ -36,7 +36,7 @@ static void uhci_rescan_work(void* ctx) {
 
 static void uhci_queue_rescan(void) {
     bool enqueue = false;
-    uint32_t flags = irq_save();
+    uintptr_t flags = irq_save();
     if (!uhci_rescan_pending) {
         uhci_rescan_pending = true;
         enqueue = true;
@@ -135,8 +135,8 @@ static uhci_ctrl_t controllers[UHCI_MAX_CONTROLLERS];
 
 static inline uint32_t phys_addr(void* p) {
     uint32_t phys;
-    if (vmm_virt_to_phys((uint32_t)p, &phys) == 0) return phys;
-    return (uint32_t)p;
+    if (vmm_virt_to_phys((uint32_t)(uintptr_t)p, &phys) == 0) return phys;
+    return (uint32_t)(uintptr_t)p;
 }
 
 static inline uint16_t rd16(uint16_t io, uint16_t off) {
@@ -1238,8 +1238,8 @@ static void uhci_enumerate_port(uhci_ctrl_t* hc, bool low_speed) {
 
         if (type == USB_DESC_INTERFACE && len >= sizeof(usb_interface_desc_t)) {
             usb_interface_desc_t* ifd = (usb_interface_desc_t*)(cfg_buf + off);
-            in_kbd = (ifd->bInterfaceClass == 0x03 && ifd->bInterfaceSubClass == 0x01 && ifd->bInterfaceProtocol == 0x01);
-            in_mouse = (ifd->bInterfaceClass == 0x03 && ifd->bInterfaceSubClass == 0x01 && ifd->bInterfaceProtocol == 0x02);
+            in_kbd = (ifd->bInterfaceClass == 0x03 && ifd->bInterfaceProtocol == 0x01);
+            in_mouse = (ifd->bInterfaceClass == 0x03 && ifd->bInterfaceProtocol == 0x02);
             if (in_kbd) hid_kbd_iface = ifd->bInterfaceNumber;
             if (in_mouse) hid_mouse_iface = ifd->bInterfaceNumber;
         } else if ((in_kbd || in_mouse) && type == USB_DESC_HID && len >= 9) {

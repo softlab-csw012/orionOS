@@ -1,259 +1,177 @@
 #include "bin.h"
 #include "elf.h"
+#include "tty.h"
 #include "kernel.h"
+#include "syscall.h"
 #include "proc/proc.h"
 #include "proc/sysmgr.h"
 #include "bootcmd.h"
-#include "../drivers/screen.h"
+#include "io/console.h"
 #include "../drivers/keyboard.h"
-#include "../fs/fscmd.h"
 #include "../mm/mem.h"
 #include "../mm/paging.h"
+#include "../mm/pmm.h"
+#include "../cpu/gdt.h"
 #include "../cpu/tss.h"
 #include "../libc/string.h"
 
-uint32_t bin_saved_esp = 0;
-uint32_t bin_saved_ebp = 0;
-uint32_t bin_saved_ebx = 0;
-uint32_t bin_saved_esi = 0;
-uint32_t bin_saved_edi = 0;
-uint32_t bin_saved_eflags = 0;
+uintptr_t bin_saved_rsp = 0;
+uintptr_t bin_saved_rbp = 0;
+uintptr_t bin_saved_rbx = 0;
+uintptr_t bin_saved_r12 = 0;
+uintptr_t bin_saved_r13 = 0;
+uintptr_t bin_saved_r14 = 0;
+uintptr_t bin_saved_r15 = 0;
+uintptr_t bin_saved_rflags = 0;
 #define EFLAGS_IF 0x200u
 
-static inline uint32_t irq_save(void) {
-    uint32_t flags = 0;
-    __asm__ volatile("pushf; pop %0; cli" : "=r"(flags) :: "memory");
+static inline uintptr_t irq_save(void) {
+    uintptr_t flags = 0;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     return flags;
 }
 
-static inline void irq_restore(uint32_t flags) {
+static inline void irq_restore(uintptr_t flags) {
     if (flags & EFLAGS_IF) {
         __asm__ volatile("sti" ::: "memory");
     }
 }
 
-static void log_user_mappings(const char* tag, process_t* p) {
-    if (!p) {
-        return;
-    }
-    uint32_t phys = 0;
-    bool miss_entry = (p->entry && vmm_virt_to_phys(p->entry, &phys) != 0);
-    bool miss_load = false;
-    bool miss_stack = false;
-    if (p->image_load_base && p->image_load_base != p->entry) {
-        miss_load = (vmm_virt_to_phys(p->image_load_base, &phys) != 0);
-    }
-    if (p->stack_base) {
-        miss_stack = (vmm_virt_to_phys(p->stack_base, &phys) != 0);
-    }
-    if (!miss_entry && !miss_load && !miss_stack) {
-        return;
-    }
-    kprintf("[USERMAP] %s pid=%u cr3=%08x pd=%08x entry=%08x load=%08x stack=%08x\n",
-            tag,
-            p->pid,
-            paging_current_dir_phys(),
-            p->page_dir_phys,
-            p->entry,
-            p->image_load_base,
-            p->stack_base);
-    if (miss_entry) {
-        dump_mapping(p->entry);
-    }
-    if (miss_load) {
-        dump_mapping(p->image_load_base);
-    }
-    if (miss_stack) {
-        dump_mapping(p->stack_base);
-    }
-}
+__attribute__((noreturn))
+void enter_user_process_c(process_t* p)
+{
+    if (!p || !p->context_esp)
+        proc_exit(1);
 
-static void ensure_user_mappings(process_t* p) {
-    if (!p || p->is_kernel || !p->page_dir || p->page_dir_phys == 0) {
-        return;
-    }
+    registers_t* frame = (registers_t*)p->context_esp;
 
-    uint32_t irq_flags = irq_save();
-    paging_set_current_dir((uint32_t*)p->page_dir, p->page_dir_phys);
+    uint64_t user_rip = frame->rip;
+    uint64_t user_rsp = frame->rsp;
+    uint64_t user_cs  = frame->cs ? frame->cs : USER_CS;
+    uint64_t user_ss  = frame->ss ? frame->ss : USER_DS;
 
-    if (p->image_base && p->image_size && p->image_load_base) {
-        for (uint32_t off = 0; off < p->image_size; off += PAGE_SIZE) {
-            uint32_t phys = 0;
-            if (vmm_virt_to_phys(p->image_base + off, &phys) != 0) {
-                kprintf("user map: image phys lookup failed (%08x)\n",
-                        p->image_base + off);
-                break;
-            }
-            vmm_map_page(p->image_load_base + off, phys,
-                         PAGE_PRESENT | PAGE_RW | PAGE_USER);
-        }
-    }
+    uint64_t user_rflags = frame->rflags ? frame->rflags : 0x202u;
+    user_rflags &= ~(1ull << 14);
+    user_rflags |= (1ull << 9);
 
-    if (p->stack_kern_base && p->stack_size && p->stack_base) {
-        for (uint32_t off = 0; off < p->stack_size; off += PAGE_SIZE) {
-            uint32_t phys = 0;
-            if (vmm_virt_to_phys(p->stack_kern_base + off, &phys) != 0) {
-                kprintf("user map: stack phys lookup failed (%08x)\n",
-                        p->stack_kern_base + off);
-                break;
-            }
-            vmm_map_page(p->stack_base + off, phys,
-                         PAGE_PRESENT | PAGE_RW | PAGE_USER);
-        }
-    }
-    irq_restore(irq_flags);
-}
+    __asm__ volatile("cli");
 
-__attribute__((noreturn, used)) static void enter_user_process_c(process_t* p) {
-    log_user_mappings("pre", p);
-    ensure_user_mappings(p);
-    log_user_mappings("post", p);
-    tss_set_kernel_stack(p->kstack_base + p->kstack_size);
-    proc_start(p->context_esp);
-}
+    uintptr_t kstack = p->kstack_base + p->kstack_size;
+    tss_set_kernel_stack(kstack);
 
-__attribute__((naked, noinline)) static void enter_user_process(process_t* p __attribute__((unused))) {
+    volatile uint64_t* probe = (uint64_t*)(uintptr_t)(user_rsp - 32u);
+    probe[0] = 0;
+    probe[1] = 0;
+
     __asm__ volatile(
-        "movl %esp, bin_saved_esp\n"
-        "movl %ebp, bin_saved_ebp\n"
-        "movl %ebx, bin_saved_ebx\n"
-        "movl %esi, bin_saved_esi\n"
-        "movl %edi, bin_saved_edi\n"
-        "pushfl\n"
-        "popl bin_saved_eflags\n"
-        "pushl 4(%esp)\n"
+        "movw %w5, %%ax\n"
+        "movw %%ax, %%ds\n"
+        "movw %%ax, %%es\n"
+        "pushq %0\n"
+        "pushq %1\n"
+        "pushq %2\n"
+        "pushq %3\n"
+        "pushq %4\n"
+        "iretq\n"
+        :
+        : "r"(user_ss),
+          "r"(user_rsp),
+          "r"(user_rflags),
+          "r"(user_cs),
+          "r"(user_rip),
+          "r"((uint64_t)USER_DS)
+        : "rax", "memory"
+    );
+
+    __builtin_unreachable();
+}
+
+__attribute__((naked, noinline)) 
+static void enter_user_process(process_t* p __attribute__((unused))) {
+    __asm__ volatile(
+        "movq %rsp, bin_saved_rsp(%rip)\n"
+        "movq %rbp, bin_saved_rbp(%rip)\n"
+        "movq %rbx, bin_saved_rbx(%rip)\n"
+        "movq %r12, bin_saved_r12(%rip)\n"
+        "movq %r13, bin_saved_r13(%rip)\n"
+        "movq %r14, bin_saved_r14(%rip)\n"
+        "movq %r15, bin_saved_r15(%rip)\n"
+        "pushfq\n"
+        "popq bin_saved_rflags(%rip)\n"
         "call enter_user_process_c\n"
+        "ud2\n"
     );
 }
 
-// ======================================================
-// 1) BIN 파일 로드
-// ======================================================
-bool load_bin(const char* path, uint32_t* phys_entry, uint32_t* out_size) {
-    uint8_t* dest = (uint8_t*)BIN_LOAD_ADDR;
-    memset(dest, 0, BIN_MAX_SIZE);
-
-    uint32_t size = fscmd_get_file_size(path);
-    if (size == 0) {
-        kprintf("BIN load failed: empty file\n");
-        return false;
-    }
-    if (size > BIN_MAX_SIZE) {
-        kprintf("BIN too large! (%u bytes)\n", size);
-        return false;
-    }
-
-    uint32_t offset = 0;
-    while (offset < size) {
-        uint32_t to_read = size - offset;
-        if (to_read > 512u) {
-            to_read = 512u;
-        }
-        if (!fscmd_read_file_partial(path, offset, dest + offset, to_read)) {
-            kprintf("BIN load failed at %u\n", offset);
-            return false;
-        }
-        offset += to_read;
-    }
-
-    *phys_entry = BIN_LOAD_ADDR;
-    *out_size   = size;
-    return true;
-}
-
-bool bin_load_image(const char* path, uint32_t* out_entry, uint32_t* out_image_base,
-                    uint32_t* out_image_size, uint32_t* out_load_base) {
+bool bin_load_image(const char* path,
+                    uintptr_t* out_entry,
+                    uintptr_t* out_image_base,
+                    uint32_t* out_image_size,
+                    uintptr_t* out_load_base)
+{
     if (!path || !out_entry || !out_image_base || !out_image_size) {
         return false;
     }
 
-    uint32_t entry = 0;
-    uint32_t image_base = 0;
+    uintptr_t entry = 0;
+    uintptr_t image_base = 0;
     uint32_t image_size = 0;
+    uintptr_t image_load_base = 0;
     bool is_elf = false;
 
-    if (elf_load_image(path, &entry, &image_base, &image_size, out_load_base, &is_elf)) {
+    if (elf_load_image(path, &entry, &image_base, &image_size, &image_load_base, &is_elf)) {
         *out_entry = entry;
         *out_image_base = image_base;
         *out_image_size = image_size;
+        if (out_load_base) {
+            *out_load_base = image_load_base;
+        }
         return true;
     }
-    if (is_elf) {
-        return false;
-    }
-
-    uint32_t phys_entry = 0;
-    uint32_t bin_size = 0;
-    if (!load_bin(path, &phys_entry, &bin_size)) {
-        return false;
-    }
-
-    uint32_t alloc_size = (bin_size + 0xFFFu) & ~0xFFFu;
-    void* virt_entry = kmalloc(alloc_size, 1, NULL);
-    if (!virt_entry) {
-        kprint("kmalloc failed\n");
-        return false;
-    }
-
-    memset(virt_entry, 0, alloc_size);
-    memcpy(virt_entry, (void*)phys_entry, bin_size);
-
-    uint32_t load_base = BIN_LOAD_ADDR;
-    uint32_t irq_flags = irq_save();
-    for (uint32_t off = 0; off < alloc_size; off += PAGE_SIZE) {
-        uint32_t phys = 0;
-        if (vmm_virt_to_phys((uint32_t)virt_entry + off, &phys) != 0) {
-            kprint("BIN image phys lookup failed\n");
-            irq_restore(irq_flags);
-            kfree(virt_entry);
-            return false;
-        }
-        vmm_map_page(load_base + off, phys, PAGE_PRESENT | PAGE_RW | PAGE_USER);
-    }
-    irq_restore(irq_flags);
-
-    *out_entry = load_base;
-    *out_image_base = (uint32_t)virt_entry;
-    *out_image_size = alloc_size;
-    if (out_load_base) {
-        *out_load_base = load_base;
-    }
-    return true;
+    return false;
 }
 
 // ======================================================
 // 4) BIN 코드 점프
 // ======================================================
-__attribute__((naked)) void jump_to_bin(uint32_t entry __attribute__((unused)),
-                                        uint32_t stack_top __attribute__((unused))) {
+__attribute__((naked)) void jump_to_bin(uintptr_t entry __attribute__((unused)),
+                                        uintptr_t stack_top __attribute__((unused))) {
     __asm__ volatile(
-        "movl 4(%esp), %eax\n"
-        "movl 8(%esp), %edx\n"
-        "movl %esp, bin_saved_esp\n"
-        "movl %edx, %esp\n"
-        "pushl $proc_exit_trampoline\n"
+        "movq %rsp, bin_saved_rsp(%rip)\n"
+        "movq %rbp, bin_saved_rbp(%rip)\n"
+        "movq %rbx, bin_saved_rbx(%rip)\n"
+        "movq %r12, bin_saved_r12(%rip)\n"
+        "movq %r13, bin_saved_r13(%rip)\n"
+        "movq %r14, bin_saved_r14(%rip)\n"
+        "movq %r15, bin_saved_r15(%rip)\n"
+        "pushfq\n"
+        "popq bin_saved_rflags(%rip)\n"
+        "movq %rsi, %rsp\n"
+        "pushq $proc_exit_trampoline\n"
         "sti\n"
-        "jmp *%eax\n"
+        "jmp *%rdi\n"
     );
 }
 
 void bin_return_to_shell(void) {
-    keyboard_input_enabled = true;
-    enable_shell = true;
-    prompt_enabled = true;
-    shell_suspended = false;
-    sysmgr_request_prompt();
+    keyboard_input_enabled = false;
+    enable_shell = false;
+    prompt_enabled = false;
+    shell_suspended = true;
+    sysmgr_request_user_shell(false);
 }
 
 __attribute__((naked)) void bin_exit_trampoline(void) {
     __asm__ volatile(
-        "movl bin_saved_esp, %esp\n"
-        "movl bin_saved_ebp, %ebp\n"
-        "movl bin_saved_ebx, %ebx\n"
-        "movl bin_saved_esi, %esi\n"
-        "movl bin_saved_edi, %edi\n"
-        "pushl bin_saved_eflags\n"
-        "popfl\n"
+        "movq bin_saved_rsp(%rip), %rsp\n"
+        "movq bin_saved_rbp(%rip), %rbp\n"
+        "movq bin_saved_rbx(%rip), %rbx\n"
+        "movq bin_saved_r12(%rip), %r12\n"
+        "movq bin_saved_r13(%rip), %r13\n"
+        "movq bin_saved_r14(%rip), %r14\n"
+        "movq bin_saved_r15(%rip), %r15\n"
+        "pushq bin_saved_rflags(%rip)\n"
+        "popfq\n"
         "call bin_return_to_shell\n"
         "ret\n"
     );
@@ -263,12 +181,11 @@ __attribute__((naked)) void bin_exit_trampoline(void) {
 // 5) init.sys 실행
 // ======================================================
 bool start_init(void) {
-    uint32_t entry = 0;
-    uint32_t image_base = 0;
+    uintptr_t entry = 0;
+    uintptr_t image_base = 0;
     uint32_t image_size = 0;
-    uint32_t image_load_base = 0;
+    uintptr_t image_load_base = 0;
     bool is_elf = false;
-
     kprint("[init.sys] Loading init.sys...\n");
 
     process_t* init_proc = proc_create_pending("/system/core/init.sys", true);
@@ -277,80 +194,37 @@ bool start_init(void) {
         return false;
     }
 
-    uint32_t irq_flags = irq_save();
-    uint32_t* prev_dir = paging_current_dir();
+    uintptr_t irq_flags = irq_save();
+    void* prev_dir = paging_current_dir();
     uint32_t prev_phys = paging_current_dir_phys();
-    paging_set_current_dir((uint32_t*)init_proc->page_dir, init_proc->page_dir_phys);
 
-    if (elf_load_image("/system/core/init.sys", &entry, &image_base, &image_size,
-                       &image_load_base, &is_elf)) {
-        kprintf("[init.sys] Loaded ELF entry %x\n", entry);
-    } else if (is_elf) {
-        kprint("[init.sys] Failed to load ELF.\n");
-        kprint("[");
-        kprint_color("ERROR", 4, 0);
-        kprint("] kernel panic: init.sys load failed!\n");
+    kprintf("[init.sys] prev pd=%016lx phys=%08x new pd=%016lx phys=%08x\n",
+            (unsigned long)(uintptr_t)prev_dir,
+            (unsigned)prev_phys,
+            (unsigned long)(uintptr_t)init_proc->page_dir,
+            (unsigned)init_proc->page_dir_phys);
+
+    /* 프로세스 주소공간으로 전환 */
+    paging_set_current_dir(init_proc->page_dir, (uint32_t)init_proc->page_dir_phys);
+    kprint("[init.sys] switched to init page dir\n");
+
+    if (elf_load_image("/system/core/init.sys",
+                       &entry, &image_base, &image_size,
+                       &image_load_base, &is_elf))
+    {
+        kprintf("[init.sys] Loaded ELF entry %lx\n", (unsigned long)entry);
+    }
+    else {
+        kprint(is_elf ? "[init.sys] Failed to load ELF\n"
+                      : "[init.sys] init.sys is not ELF\n");
         paging_set_current_dir(prev_dir, prev_phys);
         irq_restore(irq_flags);
         proc_cleanup_process(init_proc);
         return false;
-    } else {
-        uint32_t phys_entry = 0;
-        uint32_t bin_size   = 0;
-        if (!load_bin("/system/core/init.sys", &phys_entry, &bin_size)) {
-            kprint("[init.sys] Failed to load.\n");
-            kprint("[");
-            kprint_color("ERROR", 4, 0);
-            kprint("] kernel panic: init.sys missing!\n");
-            paging_set_current_dir(prev_dir, prev_phys);
-            irq_restore(irq_flags);
-            proc_cleanup_process(init_proc);
-            return false;
-        }
-
-        uint32_t alloc_size = (bin_size + 0xFFFu) & ~0xFFFu;
-        void* virt_entry = kmalloc(alloc_size, 1, NULL);
-        if (!virt_entry) {
-            kprint("[init.sys] kmalloc failed\n");
-            paging_set_current_dir(prev_dir, prev_phys);
-            irq_restore(irq_flags);
-            proc_cleanup_process(init_proc);
-            return false;
-        }
-
-        memset(virt_entry, 0, alloc_size);
-        memcpy(virt_entry, (void*)phys_entry, bin_size);
-
-        kprintf("[init.sys] Copied init.sys to virt %x (size %u)\n",
-                (uint32_t)virt_entry, bin_size);
-
-        uint32_t load_base = BIN_LOAD_ADDR;
-        uint32_t irq_flags = irq_save();
-        for (uint32_t off = 0; off < alloc_size; off += PAGE_SIZE) {
-            uint32_t phys = 0;
-            if (vmm_virt_to_phys((uint32_t)virt_entry + off, &phys) != 0) {
-                kprint("[init.sys] image phys lookup failed\n");
-                irq_restore(irq_flags);
-                kfree(virt_entry);
-            paging_set_current_dir(prev_dir, prev_phys);
-            irq_restore(irq_flags);
-            proc_cleanup_process(init_proc);
-            return false;
-        }
-            vmm_map_page(load_base + off, phys, PAGE_PRESENT | PAGE_RW | PAGE_USER);
-        }
-        irq_restore(irq_flags);
-
-        entry = load_base;
-        image_base = (uint32_t)virt_entry;
-        image_size = alloc_size;
-        image_load_base = load_base;
     }
 
+    /* 유저 스택 + 레지스터 프레임 생성 */
     if (!proc_build_user_frame(init_proc, entry, NULL, 0)) {
-        if (image_base) {
-            kfree((void*)image_base);
-        }
         paging_set_current_dir(prev_dir, prev_phys);
         irq_restore(irq_flags);
         proc_cleanup_process(init_proc);
@@ -361,10 +235,30 @@ bool start_init(void) {
     init_proc->image_size = image_size;
     init_proc->image_load_base = image_load_base;
     init_proc->entry = entry;
+
+    kprintf("[init.sys] entry=%016lx load=%016lx image=%016lx size=%u stack=%08x pd=%08x\n",
+            (unsigned long)init_proc->entry,
+            (unsigned long)init_proc->image_load_base,
+            (unsigned long)init_proc->image_base,
+            init_proc->image_size,
+            (unsigned)init_proc->stack_base,
+            (unsigned)init_proc->page_dir_phys);
+    dump_mapping((uint32_t)init_proc->entry);
+    dump_mapping((uint32_t)init_proc->image_load_base);
+    dump_mapping((uint32_t)init_proc->stack_base);
+
+    attach_default_stdio(init_proc->pid, 0);
+    tty_set_foreground(init_proc->pid);
     proc_set_foreground_pid(init_proc->pid);
 
-    paging_set_current_dir((uint32_t*)init_proc->page_dir, init_proc->page_dir_phys);
-    irq_restore(irq_flags);
+    /* 실행: keep IRQs disabled until iretq so CR3/current_proc cannot drift. */
+    if (!proc_make_current(init_proc, NULL)) {
+        paging_set_current_dir(prev_dir, prev_phys);
+        irq_restore(irq_flags);
+        proc_cleanup_process(init_proc);
+        return false;
+    }
+
     enter_user_process(init_proc);
     proc_exit(0);
     return true;
@@ -387,72 +281,26 @@ process_t* bin_create_process(const char* path, const char* const* argv, int arg
         return NULL;
     }
 
-    uint32_t entry = 0;
-    uint32_t image_base = 0;
+    uintptr_t entry = 0;
+    uintptr_t image_base = 0;
     uint32_t image_size = 0;
-    uint32_t image_load_base = 0;
+    uintptr_t image_load_base = 0;
     bool is_elf = false;
 
-    uint32_t irq_flags = irq_save();
-    uint32_t* prev_dir = paging_current_dir();
+    uintptr_t irq_flags = irq_save();
+    void* prev_dir = paging_current_dir();
     uint32_t prev_phys = paging_current_dir_phys();
-    paging_set_current_dir((uint32_t*)bin_proc->page_dir, bin_proc->page_dir_phys);
+    paging_set_current_dir(bin_proc->page_dir, (uint32_t)bin_proc->page_dir_phys);
 
-    if (elf_load_image(path, &entry, &image_base, &image_size, &image_load_base, &is_elf)) {
-        kprintf("Executing ELF %s at entry %x\n", path, entry);
-    } else if (is_elf) {
-        kprintf("ELF load failed: %s\n", path);
+    if (elf_load_image(path, &entry, &image_base, &image_size,
+                       &image_load_base, &is_elf)) {
+        kprintf("Executing ELF %s at entry %lx\n", path, (unsigned long)entry);
+    } else {
+        kprintf(is_elf ? "ELF load failed: %s\n" : "Not an ELF executable: %s\n", path);
         paging_set_current_dir(prev_dir, prev_phys);
         irq_restore(irq_flags);
         proc_cleanup_process(bin_proc);
         return NULL;
-    } else {
-        uint32_t phys_entry = 0;
-        uint32_t bin_size   = 0;
-
-        if (!load_bin(path, &phys_entry, &bin_size)) {
-            kprintf("Failed to load %s\n", path);
-            paging_set_current_dir(prev_dir, prev_phys);
-            irq_restore(irq_flags);
-            proc_cleanup_process(bin_proc);
-            return NULL;
-        }
-
-        uint32_t alloc_size = (bin_size + 0xFFFu) & ~0xFFFu;
-        void* virt_entry = kmalloc(alloc_size, 1, NULL);
-        if (!virt_entry) {
-            kprint("kmalloc failed\n");
-            paging_set_current_dir(prev_dir, prev_phys);
-            irq_restore(irq_flags);
-            proc_cleanup_process(bin_proc);
-            return NULL;
-        }
-
-        memset(virt_entry, 0, alloc_size);
-        memcpy(virt_entry, (void*)phys_entry, bin_size);
-
-        kprintf("Executing %s at virt %x\n", path, (uint32_t)virt_entry);
-
-        uint32_t load_base = BIN_LOAD_ADDR;
-        uint32_t irq_flags = irq_save();
-        for (uint32_t off = 0; off < alloc_size; off += PAGE_SIZE) {
-            uint32_t phys = 0;
-            if (vmm_virt_to_phys((uint32_t)virt_entry + off, &phys) != 0) {
-                kprint("BIN image phys lookup failed\n");
-                irq_restore(irq_flags);
-                kfree(virt_entry);
-                paging_set_current_dir(prev_dir, prev_phys);
-                proc_cleanup_process(bin_proc);
-                return NULL;
-            }
-            vmm_map_page(load_base + off, phys, PAGE_PRESENT | PAGE_RW | PAGE_USER);
-        }
-        irq_restore(irq_flags);
-
-        entry = load_base;
-        image_base = (uint32_t)virt_entry;
-        image_size = alloc_size;
-        image_load_base = load_base;
     }
 
     if (!proc_build_user_frame(bin_proc, entry, use_argv, use_argc)) {
@@ -475,14 +323,32 @@ process_t* bin_create_process(const char* path, const char* const* argv, int arg
     return bin_proc;
 }
 
+__attribute__((noreturn))
+static void switch_to_kstack_and_enter(process_t* p)
+{
+    uintptr_t new_sp = p->kstack_base + p->kstack_size - 16u;
+
+    __asm__ volatile(
+        "mov %0, %%rsp\n"
+        "mov %1, %%rdi\n"
+        "call enter_user_process_c\n"
+        :
+        : "r"(new_sp), "r"(p)
+        : "rdi", "memory"
+    );
+
+    __builtin_unreachable();
+}
+
 // ======================================================
 // 6) 일반 BIN 실행
 // ======================================================
 bool start_bin(const char* path, const char* const* argv, int argc) {
     keyboard_input_enabled = false;
+
     process_t* bin_proc = bin_create_process(path, argv, argc, true);
     if (!bin_proc) {
-        keyboard_input_enabled = true;
+        keyboard_input_enabled = false;
         return false;
     }
 
@@ -490,15 +356,20 @@ bool start_bin(const char* path, const char* const* argv, int argc) {
     if (!proc_make_current(bin_proc, regs)) {
         proc_set_last_regs(NULL);
         kprint("bin: failed to switch foreground task\n");
-        keyboard_input_enabled = true;
+        keyboard_input_enabled = false;
         return false;
     }
     proc_set_last_regs(NULL);
+
+    /* ⭐ 매우 중요: 실제 실행 전 CR3 전환 */
+    paging_set_current_dir(bin_proc->page_dir, (uint32_t)bin_proc->page_dir_phys);
+
     proc_set_foreground_pid(bin_proc->pid);
-    enter_user_process(bin_proc);
+
+    switch_to_kstack_and_enter(bin_proc);
     proc_exit(0);
 
-    keyboard_input_enabled = true;
+    keyboard_input_enabled = false;
     return true;
 }
 

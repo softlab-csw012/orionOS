@@ -1,6 +1,6 @@
 #include "xvfs.h"
 #include "fscmd.h"
-#include "../drivers/ata.h"
+#include "../drivers/blockdev.h"
 #include "../drivers/screen.h"
 #include "../kernel/kernel.h"
 #include "../kernel/cmd.h"
@@ -26,21 +26,24 @@ typedef struct {
 #pragma pack(pop)
 
 static uint32_t xvfs_resolve_path(const char* path, bool want_dir, char* out_name);
+static uint32_t xvfs_blocks_for_size(uint32_t size) {
+    return (size + XVFS_BLOCK_SIZE - 1) / XVFS_BLOCK_SIZE;
+}
 
 static bool read_block(uint32_t lba, void* buf) {
-    return ata_read_sector(xvfs_drive, xvfs_base_lba + lba, buf);
+    return blockdev_read_sector(xvfs_drive, xvfs_base_lba + lba, buf);
 }
 static bool write_block(uint32_t lba, const void* buf) {
-    return ata_write_sector(xvfs_drive, xvfs_base_lba + lba, buf);
+    return blockdev_write_sector(xvfs_drive, xvfs_base_lba + lba, buf);
 }
 
 static bool probe_xvfs(uint8_t drive, uint32_t base_lba, XVFS_Superblock* out_sb) {
     uint8_t sec0[512];
     uint8_t sec1[512];
 
-    if (!ata_read(drive, base_lba + 0, 1, sec0)) return false;
-    if (memcmp(sec0, "XVFS2", 5) != 0) return false;
-    if (!ata_read(drive, base_lba + 1, 1, sec1)) return false;
+    if (!blockdev_read(drive, base_lba + 0, 1, sec0)) return false;
+    if (memcmp(sec0, "XVFS3", 5) != 0) return false;
+    if (!blockdev_read(drive, base_lba + 1, 1, sec1)) return false;
 
     XVFS_Superblock tmp;
     memcpy(&tmp, sec1, sizeof(XVFS_Superblock));
@@ -51,28 +54,7 @@ static bool probe_xvfs(uint8_t drive, uint32_t base_lba, XVFS_Superblock* out_sb
     *out_sb = tmp;
     return true;
 }
-/*
-static bool find_xvfs_in_mbr(uint8_t drive, uint32_t* out_base_lba, XVFS_Superblock* out_sb) {
-    uint8_t sec[512];
-    if (!ata_read(drive, 0, 1, sec)) return false;
-    if (sec[510] != 0x55 || sec[511] != 0xAA) return false;
 
-    const MBRPart* p = (const MBRPart*)(sec + 0x1BE);
-
-    for (size_t i = 0; i < 4; i++) {
-        if (p[i].type == 0 || p[i].lba_first == 0)
-            continue;
-
-        // XVFS는 특정 type을 지정할 수 없으므로 그냥 모든 파티션에서 검사
-        if (probe_xvfs(drive, p[i].lba_first, out_sb)) {
-            if (out_base_lba) *out_base_lba = p[i].lba_first;
-            return true;
-        }
-    }
-
-    return false;
-}
-*/
 bool xvfs_init(uint8_t drive, uint32_t base_lba) {
     XVFS_Superblock sb_local;
     if (!probe_xvfs(drive, base_lba, &sb_local)) {
@@ -84,28 +66,12 @@ bool xvfs_init(uint8_t drive, uint32_t base_lba) {
     xvfs_base_lba = base_lba;
     memcpy(&sb, &sb_local, sizeof(sb));
 
-    current_dir_block = sb.data_start; // ✅ 루트 디렉토리로 설정
+    current_dir_block = sb.root_dir_block;
+    xvfs_root_block = sb.root_dir_block;
     kprintf("[XVFS] Mounted drive %d successfully\n", drive);
     kprintf("  Block size: %u, Root LBA=%u\n", sb.block_size, current_dir_block);
     return true;
 }
-/*
-static int xvfs_find_entry(uint32_t dir_block, const char* name, XVFS_FileEntry* out, int* out_index) {
-    uint8_t buf[512];
-    read_block(dir_block, buf);
-    XVFS_FileEntry* e = (XVFS_FileEntry*)buf;
-
-    for (size_t i = 0; i < 512 / sizeof(XVFS_FileEntry); i++) {
-        if (e[i].name[0] == 0x00 || e[i].name[0] == 0xE5) continue;
-        if (strncmp(e[i].name, name, XVFS_MAX_NAME) == 0) {
-            if (out) memcpy(out, &e[i], sizeof(XVFS_FileEntry));
-            if (out_index) *out_index = i;
-            return 1;
-        }
-    }
-    return 0;
-}
-*/
 
 static void xvfs_mark_block(uint32_t block, bool used) {
     uint8_t bitbuf[512];
@@ -116,7 +82,7 @@ static void xvfs_mark_block(uint32_t block, bool used) {
     uint32_t byte_index = bit_index / 8;
     uint8_t bit = 1 << (bit_index % 8);
 
-    ata_read_sector(xvfs_drive, xvfs_base_lba + sb.bitmap_start + blk, bitbuf);
+    blockdev_read_sector(xvfs_drive, xvfs_base_lba + sb.bitmap_start + blk, bitbuf);
 
     if (used) {
         if (!(bitbuf[byte_index] & bit)) {
@@ -130,7 +96,7 @@ static void xvfs_mark_block(uint32_t block, bool used) {
         }
     }
 
-    ata_write_sector(xvfs_drive, xvfs_base_lba + sb.bitmap_start + blk, bitbuf);
+    blockdev_write_sector(xvfs_drive, xvfs_base_lba + sb.bitmap_start + blk, bitbuf);
 }
 
 static inline bool xvfs_is_reserved(uint32_t block) {
@@ -143,7 +109,7 @@ static uint32_t xvfs_find_free_block(void) {
     uint8_t buf[512];
 
     for (uint32_t blk = 0; blk < bitmap_blocks; blk++) {
-        if (!ata_read_sector(xvfs_drive, xvfs_base_lba + sb.bitmap_start + blk, buf))
+        if (!blockdev_read_sector(xvfs_drive, xvfs_base_lba + sb.bitmap_start + blk, buf))
             return 0;
 
         for (uint32_t byte = 0; byte < 512; byte++) {
@@ -211,7 +177,7 @@ void xvfs_ls(const char* path) {
             kprint("[file]  ");
 
             // 파일 사이즈 right align
-            itoa(entry[i].size, numbuf, 10);
+            itoa(entry[i].size_bytes, numbuf, 10);
             int szlen = strlen(numbuf);
 
             for (int pad = szlen; pad < 8; pad++)
@@ -335,10 +301,10 @@ bool xvfs_read_file_range(XVFS_FileEntry* entry, uint32_t offset, uint8_t* out_b
         return false;
 
     // 파일 크기 초과 방지
-    if (offset >= entry->size)
+    if (offset >= entry->size_bytes)
         return false;
-    if (offset + size > entry->size)
-        size = entry->size - offset;
+    if (offset + size > entry->size_bytes)
+        size = entry->size_bytes - offset;
 
     uint32_t block_size = sb.block_size;  // 일반적으로 512
     uint8_t tmp[512];
@@ -346,14 +312,14 @@ bool xvfs_read_file_range(XVFS_FileEntry* entry, uint32_t offset, uint8_t* out_b
     uint32_t remaining = size;
 
     // 파일 시작 블록
-    uint32_t start_block = entry->start;
+    uint32_t start_block = entry->ext[0].start;
     uint32_t block_offset = offset / block_size;        // 읽기 시작할 블록 인덱스
     uint32_t byte_offset  = offset % block_size;        // 블록 내부 오프셋
     uint32_t current_block = start_block + block_offset;
 
     // ───── 읽기 루프 ─────
     while (remaining > 0) {
-        if (!ata_read_sector(xvfs_drive, xvfs_base_lba + current_block, tmp)) {
+        if (!blockdev_read_sector(xvfs_drive, xvfs_base_lba + current_block, tmp)) {
             kprintf("xvfs_read_file_range: read error at block %u\n", current_block);
             return false;
         }
@@ -374,57 +340,32 @@ bool xvfs_read_file_range(XVFS_FileEntry* entry, uint32_t offset, uint8_t* out_b
 }
 
 void xvfs_cat(const char* path) {
-    char name[17] = {0};
-
-    // ① 부모 디렉토리 블록 얻기
-    uint32_t dir_block = xvfs_resolve_path(path, false, name);
-    if (!dir_block) {
-        kprintf("xvfs: invalid path: %s\n", path);
-        return;
-    }
-
-    // ② 디렉토리 읽기
-    uint8_t buf[512];
-    read_block(dir_block, buf);
-    XVFS_FileEntry* entry = (XVFS_FileEntry*)buf;
-
-    // ③ 파일 엔트리 탐색
-    XVFS_FileEntry* target = NULL;
-    for (size_t i = 0; i < 512 / sizeof(XVFS_FileEntry); i++) {
-        if ((uint8_t)entry[i].name[0] == 0x00 || (uint8_t)entry[i].name[0] == 0xE5)
-            continue;
-
-        if (strncmp(entry[i].name, name, XVFS_MAX_NAME) == 0 && !(entry[i].attr & 1)) {
-            target = &entry[i];
-            break;
-        }
-    }
-
-    // ④ 파일이 없으면 메시지 출력
-    if (!target) {
+    XVFS_FileEntry target;
+    if (!xvfs_find_file(path, &target)) {
         kprintf("xvfs: file not found: %s\n", path);
         return;
     }
 
-    // ⑤ 파일 읽기
-    uint32_t start_block = target->start;
-    uint32_t size = target->size;
-
     uint8_t tmp[512];
-    uint32_t remaining = size;
-    while (remaining > 0) {
-        ata_read_sector(xvfs_drive, xvfs_base_lba + start_block, tmp);
-        uint32_t chunk = (remaining > 512) ? 512 : remaining;
+    uint32_t remaining = target.size_bytes;
+    uint32_t lba = target.ext[0].start;
 
+    while (remaining > 0) {
+        if (!blockdev_read_sector(xvfs_drive, xvfs_base_lba + lba, tmp)) {
+            kprintf("xvfs_cat: read error at block %u\n", lba);
+            break;
+        }
+        uint32_t chunk = (remaining > 512) ? 512 : remaining;
         for (uint32_t i = 0; i < chunk; i++) {
-            if (tmp[i] == '\0') break;
             putchar(tmp[i]);
         }
-
         remaining -= chunk;
-        start_block++;
+        lba++;
     }
 
+    if (target.size_bytes == 0) {
+        kprint("(empty)");
+    }
     kprint("\n");
 }
 
@@ -446,7 +387,7 @@ bool xvfs_create_file(const char* fullpath, const uint8_t* data, uint32_t size) 
     // ───── 빈 엔트리 찾기 ─────
     int slot = -1;
     for (size_t i = 0; i < 512 / sizeof(XVFS_FileEntry); i++) {
-        if (entry[i].name[0] == 0 || entry[i].name[0] == (char)0xFF) {
+        if (entry[i].name[0] == 0 || entry[i].name[0] == (char)0xE5) {
             slot = i;
             break;
         }
@@ -464,11 +405,13 @@ bool xvfs_create_file(const char* fullpath, const uint8_t* data, uint32_t size) 
     }
 
     // ───── 파일 엔트리 생성 ─────
-    memset(entry[slot].name, 0, 16);
+    memset(&entry[slot], 0, sizeof(XVFS_FileEntry));
     strncpy(entry[slot].name, name, XVFS_MAX_NAME - 1);
-    entry[slot].start = start_block;
-    entry[slot].size = size;
+    entry[slot].ext[0].start = start_block;
+    entry[slot].ext[0].length = xvfs_blocks_for_size(size);
+    entry[slot].size_bytes = size;
     entry[slot].attr = 0; // 일반 파일
+    entry[slot].extent_count = (entry[slot].ext[0].length > 0) ? 1 : 0;
 
     // ───── 데이터 쓰기 ─────
     uint32_t written = 0;
@@ -477,7 +420,7 @@ bool xvfs_create_file(const char* fullpath, const uint8_t* data, uint32_t size) 
     uint32_t full_sectors = size / 512;
     while (full_sectors > 0) {
         uint16_t count = (full_sectors > 256) ? 256 : (uint16_t)full_sectors;
-        ata_write(xvfs_drive, xvfs_base_lba + current_block, count, data + written);
+        blockdev_write(xvfs_drive, xvfs_base_lba + current_block, count, data + written);
         written += (uint32_t)count * 512;
         current_block += count;
         full_sectors -= count;
@@ -489,7 +432,7 @@ bool xvfs_create_file(const char* fullpath, const uint8_t* data, uint32_t size) 
         uint8_t tmp[512];
         memset(tmp, 0, 512);
         memcpy(tmp, data + written, tail);
-        ata_write_sector(xvfs_drive, xvfs_base_lba + current_block, tmp);
+        blockdev_write_sector(xvfs_drive, xvfs_base_lba + current_block, tmp);
         written += tail;
         current_block++;
         fscmd_write_progress_update(written);
@@ -534,12 +477,12 @@ bool xvfs_write_file(const char* fullpath, const uint8_t* data, uint32_t size) {
 
     // ───── 덮어쓰기 ─────
     uint32_t written = 0;
-    uint32_t current_block = target->start;
+    uint32_t current_block = target->ext[0].start;
 
     uint32_t full_sectors = size / 512;
     while (full_sectors > 0) {
         uint16_t count = (full_sectors > 256) ? 256 : (uint16_t)full_sectors;
-        ata_write(xvfs_drive, xvfs_base_lba + current_block, count, data + written);
+        blockdev_write(xvfs_drive, xvfs_base_lba + current_block, count, data + written);
         written += (uint32_t)count * 512;
         current_block += count;
         full_sectors -= count;
@@ -551,13 +494,15 @@ bool xvfs_write_file(const char* fullpath, const uint8_t* data, uint32_t size) {
         uint8_t tmp[512];
         memset(tmp, 0, 512);
         memcpy(tmp, data + written, tail);
-        ata_write_sector(xvfs_drive, xvfs_base_lba + current_block, tmp);
+        blockdev_write_sector(xvfs_drive, xvfs_base_lba + current_block, tmp);
         written += tail;
         current_block++;
         fscmd_write_progress_update(written);
     }
 
-    target->size = size;
+    target->size_bytes = size;
+    target->ext[0].length = xvfs_blocks_for_size(size);
+    target->extent_count = (target->ext[0].length > 0) ? 1 : 0;
     write_block(dir_block, buf);
 
     kprintf("xvfs: wrote '%s' (%u bytes)\n", name, size);
@@ -586,8 +531,8 @@ bool xvfs_rm(const char* path) {
             continue;
         if (strncmp(entry[i].name, name, 16) == 0 && !(entry[i].attr & 1)) {
             found = i;
-            start_block = entry[i].start;
-            file_blocks = (entry[i].size + 511) / 512;
+            start_block = entry[i].ext[0].start;
+            file_blocks = (entry[i].size_bytes + 511) / 512;
             break;
         }
     }
@@ -603,7 +548,7 @@ bool xvfs_rm(const char* path) {
     for (uint32_t b = 0; b < file_blocks; b++) {
         uint32_t blk = start_block + b;
         if (!xvfs_is_reserved(blk)) {
-            ata_write_sector(xvfs_drive, xvfs_base_lba + blk, zero);
+            blockdev_write_sector(xvfs_drive, xvfs_base_lba + blk, zero);
             xvfs_mark_block(blk, false);
         }
     }
@@ -628,17 +573,17 @@ uint32_t xvfs_read_file_by_name(const char* filename, uint8_t* outbuf, uint32_t 
         return 0;
     }
 
-    uint32_t size = target.size;
+    uint32_t size = target.size_bytes;
     if (size > maxsize) size = maxsize;
 
-    uint32_t start = target.start;
+    uint32_t start = target.ext[0].start;
     uint8_t tmp[512];
     uint32_t remaining = size;
     uint32_t offset = 0;
 
     // ✅ 파일 블록은 여전히 xvfs_base_lba 기준으로 읽어야 함
     while (remaining > 0) {
-        ata_read_sector(xvfs_drive, xvfs_base_lba + start, tmp);
+        blockdev_read_sector(xvfs_drive, xvfs_base_lba + start, tmp);
         uint32_t chunk = (remaining > 512) ? 512 : remaining;
         memcpy(outbuf + offset, tmp, chunk);
         offset += chunk;
@@ -680,14 +625,14 @@ bool xvfs_cp(const char* src_path, const char* dst_path) {
     }
 
     // ③ 원본 데이터 읽기
-    uint32_t size = src_target->size;
+    uint32_t size = src_target->size_bytes;
     uint32_t remaining = size;
-    uint32_t lba = src_target->start;
+    uint32_t lba = src_target->ext[0].start;
     uint32_t offset = 0;
 
     while (remaining > 0) {
         uint8_t tmp[512];
-        ata_read_sector(xvfs_drive, xvfs_base_lba + lba++, tmp);
+        blockdev_read_sector(xvfs_drive, xvfs_base_lba + lba++, tmp);
         uint32_t chunk = (remaining > 512) ? 512 : remaining;
         memcpy(buffer + offset, tmp, chunk);
         offset += chunk;
@@ -764,7 +709,7 @@ static uint32_t xvfs_resolve_path(const char* path, bool want_dir, char* out_nam
     // want_dir = true  → 마지막 토큰이 디렉토리여야 함 (cd, ls 등)
     // want_dir = false → 마지막 토큰은 파일로 간주 (create, cat, rm 등)
 
-    uint32_t dir_block = (path[0] == '/') ? sb.data_start : current_dir_block;
+    uint32_t dir_block = (path[0] == '/') ? sb.root_dir_block : current_dir_block;
 
     // 경로 복사
     char tmp[128];
@@ -793,14 +738,14 @@ static uint32_t xvfs_resolve_path(const char* path, bool want_dir, char* out_nam
                     // 중간 경로는 반드시 디렉토리
                     if (!(entry[i].attr & 1))
                         return 0;
-                    dir_block = entry[i].start;
+                    dir_block = entry[i].ext[0].start;
                     found = true;
                 } else {
                     // 마지막 토큰
                     if (want_dir) {
                         // cd, ls, mkdir — 디렉토리만 허용
                         if (entry[i].attr & 1) {
-                            dir_block = entry[i].start;
+                            dir_block = entry[i].ext[0].start;
                             found = true;
                         } else {
                             return 0; // 마지막이 파일인데 디렉토리 요구
@@ -876,22 +821,28 @@ static bool xvfs_create_dir_at(uint32_t parent_block, const char* name) {
         return false;
     }
 
-    memset(entry[slot].name, 0, XVFS_MAX_NAME);
+    memset(&entry[slot], 0, sizeof(XVFS_FileEntry));
     strncpy(entry[slot].name, name, XVFS_MAX_NAME - 1);
-    entry[slot].start = dir_block;
-    entry[slot].size = 0;
+    entry[slot].ext[0].start = dir_block;
+    entry[slot].ext[0].length = 1;
+    entry[slot].size_bytes = 0;
     entry[slot].attr = 1;
+    entry[slot].extent_count = 1;
 
     XVFS_FileEntry newdir[512 / sizeof(XVFS_FileEntry)];
     memset(newdir, 0, sizeof(newdir));
 
     strcpy(newdir[0].name, ".");
-    newdir[0].start = dir_block;
+    newdir[0].ext[0].start = dir_block;
+    newdir[0].ext[0].length = 1;
     newdir[0].attr = 1;
+    newdir[0].extent_count = 1;
 
     strcpy(newdir[1].name, "..");
-    newdir[1].start = parent_block;
+    newdir[1].ext[0].start = parent_block;
+    newdir[1].ext[0].length = 1;
     newdir[1].attr = 1;
+    newdir[1].extent_count = 1;
 
     if (!write_block(dir_block, newdir)) {
         kprint("xvfs: failed to write new directory block\n");
@@ -982,7 +933,7 @@ bool xvfs_rmdir(const char* path) {
             continue;
         if (strncmp(entry[i].name, name, XVFS_MAX_NAME) == 0 && (entry[i].attr & 1)) {
             found = i;
-            dir_block = entry[i].start;
+            dir_block = entry[i].ext[0].start;
             break;
         }
     }
@@ -1027,14 +978,14 @@ uint32_t xvfs_get_file_size(const char* path) {
         return 0;
     }
 
-    return entry.size;
+    return entry.size_bytes;
 }
 
 int xvfs_read_file(XVFS_FileEntry* entry, uint8_t* out_buf, uint32_t offset, uint32_t size) {
     if (!entry || !out_buf)
         return -1;
 
-    uint32_t file_size = entry->size;
+    uint32_t file_size = entry->size_bytes;
 
     // offset이 파일 크기를 넘으면 읽을 게 없음
     if (offset >= file_size)
@@ -1048,7 +999,7 @@ int xvfs_read_file(XVFS_FileEntry* entry, uint8_t* out_buf, uint32_t offset, uin
     uint32_t bytes_to_read = size;
     uint32_t bytes_read = 0;
 
-    uint32_t file_start_block = entry->start;
+    uint32_t file_start_block = entry->ext[0].start;
 
     uint32_t block_offset = offset / block_size;  // 몇 번째 블록인가?
     uint32_t intra_offset = offset % block_size;  // 블록 안에서 어디서 시작?
@@ -1060,7 +1011,7 @@ int xvfs_read_file(XVFS_FileEntry* entry, uint8_t* out_buf, uint32_t offset, uin
     while (bytes_to_read > 0)
     {
         // 블록 읽기
-        if (!ata_read_sector(xvfs_drive,
+        if (!blockdev_read_sector(xvfs_drive,
                              xvfs_base_lba + current_block,
                              tmp))
         {
@@ -1098,14 +1049,14 @@ bool xvfs_read_file_partial(const char* path, uint32_t offset, uint8_t* out_buf,
     }
 
     // ② 범위 체크
-    if (offset >= entry.size) {
-        kprintf("xvfs_read_file_partial: offset beyond file size (%u >= %u)\n", offset, entry.size);
+    if (offset >= entry.size_bytes) {
+        kprintf("xvfs_read_file_partial: offset beyond file size (%u >= %u)\n", offset, entry.size_bytes);
         return false;
     }
 
     // ③ 범위를 넘어가면 자동으로 잘라냄
-    if (offset + size > entry.size)
-        size = entry.size - offset;
+    if (offset + size > entry.size_bytes)
+        size = entry.size_bytes - offset;
 
     // ④ 부분 읽기 수행
     return xvfs_read_file_range(&entry, offset, out_buf, size);
@@ -1130,7 +1081,7 @@ uint32_t xvfs_free_clusters() {
     uint32_t free_count = 0;
 
     for (uint32_t blk = 0; blk < bitmap_blocks; blk++) {
-        if (!ata_read_sector(xvfs_drive, xvfs_base_lba + sb.bitmap_start + blk, buf))
+        if (!blockdev_read_sector(xvfs_drive, xvfs_base_lba + sb.bitmap_start + blk, buf))
             continue;
         for (uint32_t byte = 0; byte < 512; byte++) {
             uint8_t b = buf[byte];
@@ -1164,50 +1115,50 @@ bool xvfs_format_at(uint8_t drive, uint32_t base_lba, uint32_t total_sectors) {
     sb.block_size = 512;
     sb.total_blocks = total_sectors;
     sb.bitmap_start = 2;  // sector 0=signature, 1=superblock, 2부터 bitmap
-    sb.data_start = 10;   // bitmap 이후 데이터 블록 시작
+    uint32_t bitmap_blocks = (sb.total_blocks + (512 * 8 - 1)) / (512 * 8);
+    sb.data_start = sb.bitmap_start + bitmap_blocks;
     sb.root_dir_block = sb.data_start;
-    sb.free_blocks = total_sectors - sb.data_start - 1;  // root 한 개 차지
+    sb.free_blocks = total_sectors - (sb.root_dir_block + 1);  // root 한 개 차지
 
     kprintf("[XVFS] Formatting drive %d (base LBA=%u)...\n", drive, base_lba);
     kprintf("  Total sectors: %u\n", total_sectors);
     kprintf("  Data start: %u\n", sb.data_start);
 
     // ────────────────────────────────
-    // [LBA 0] 시그니처 섹터 ("XVFS2")
+    // [LBA 0] 시그니처 섹터 ("XVFS3")
     // ────────────────────────────────
     memset(sector, 0, 512);
-    memcpy(sector, "XVFS2", 5);
+    memcpy(sector, "XVFS3", 5);
     sector[510] = 0x55;
     sector[511] = 0xAA;
-    ata_write_sector(drive, base_lba + 0, sector);
+    blockdev_write_sector(drive, base_lba + 0, sector);
 
     // ────────────────────────────────
     // [LBA 1] Superblock 저장
     // ────────────────────────────────
     memset(sector, 0, 512);
     memcpy(sector, &sb, sizeof(XVFS_Superblock));
-    ata_write_sector(drive, base_lba + 1, sector);
+    blockdev_write_sector(drive, base_lba + 1, sector);
 
     // ────────────────────────────────
     // [LBA 2~9] 비트맵 영역 초기화
     // ────────────────────────────────
     memset(sector, 0, 512);
-    uint32_t bitmap_blocks = sb.data_start - sb.bitmap_start;
     for (uint32_t i = 0; i < bitmap_blocks; i++) {
-        ata_write_sector(drive, base_lba + sb.bitmap_start + i, sector);
+        blockdev_write_sector(drive, base_lba + sb.bitmap_start + i, sector);
     }
 
     // 예약 영역 및 루트 디렉터리 비트마크 설정
-    for (uint32_t b = 0; b < sb.data_start + 1; b++) {
+    for (uint32_t b = 0; b < sb.root_dir_block + 1; b++) {
         uint32_t bits_per_block = 512 * 8;
         uint32_t blk = b / bits_per_block;
         uint32_t bit = b % bits_per_block;
         uint32_t byte = bit / 8;
         uint8_t mask = 1 << (bit % 8);
 
-        ata_read_sector(drive, base_lba + sb.bitmap_start + blk, sector);
+        blockdev_read_sector(drive, base_lba + sb.bitmap_start + blk, sector);
         sector[byte] |= mask;
-        ata_write_sector(drive, base_lba + sb.bitmap_start + blk, sector);
+        blockdev_write_sector(drive, base_lba + sb.bitmap_start + blk, sector);
     }
 
     // ────────────────────────────────
@@ -1216,7 +1167,7 @@ bool xvfs_format_at(uint8_t drive, uint32_t base_lba, uint32_t total_sectors) {
     XVFS_FileEntry rootdir[512 / sizeof(XVFS_FileEntry)];
     memset(rootdir, 0, sizeof(rootdir));
 
-    ata_write_sector(drive, base_lba + sb.root_dir_block, (const uint8_t*)rootdir);
+    blockdev_write_sector(drive, base_lba + sb.root_dir_block, (const uint8_t*)rootdir);
 
     // ────────────────────────────────
     // 완료 메시지
@@ -1230,6 +1181,6 @@ bool xvfs_format_at(uint8_t drive, uint32_t base_lba, uint32_t total_sectors) {
 }
 
 bool xvfs_format(uint8_t drive) {
-    uint32_t total_sectors = ata_get_sector_count(drive);
+    uint32_t total_sectors = blockdev_get_sector_count(drive);
     return xvfs_format_at(drive, 0, total_sectors);
 }

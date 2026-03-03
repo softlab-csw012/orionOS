@@ -20,7 +20,7 @@ extern bool enable_font;
 extern bool ramdisk_enable;
 extern char ramdisk_path[];
 extern bool ramdisk_mod_present;
-extern uint32_t ramdisk_mod_start;
-extern uint32_t ramdisk_mod_end;
+extern uintptr_t ramdisk_mod_start;
+extern uintptr_t ramdisk_mod_end;
 extern char ramdisk_mod_cmdline[];
 #endif

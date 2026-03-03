@@ -33,6 +33,14 @@ void hal_disable_interrupts(void) {
     asm volatile("cli");
 }
 
+void sti(void) {
+    hal_enable_interrupts();
+}
+
+void cli(void) {
+    hal_disable_interrupts();
+}
+
 void hal_halt(void) {
     asm volatile("hlt");
 }

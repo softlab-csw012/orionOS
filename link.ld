@@ -1,45 +1,49 @@
-OUTPUT_FORMAT(elf32-i386)
+OUTPUT_FORMAT(elf64-x86-64)
+OUTPUT_ARCH(i386:x86-64)
 ENTRY(_start)
+
+KERNEL_LMA  = 0x00200000;
+KERNEL_VMA  = 0xffffffff80000000;
+KERNEL_BASE = KERNEL_VMA + KERNEL_LMA;
+
+PHDRS
+{
+    text   PT_LOAD FLAGS(5);
+    rodata PT_LOAD FLAGS(4);
+    data   PT_LOAD FLAGS(6);
+}
 
 SECTIONS
 {
-    /* 커널 로드 주소 (1MB = 0x00100000) */
-    . = 1M;
+    . = KERNEL_BASE;
 
     _kernel_start = .;
 
-    /* Multiboot2 헤더는 반드시 ELF의 첫 32KB 이내에 위치해야 함 */
-    .multiboot_header ALIGN(8) : {
-        KEEP(*(.multiboot_header))
-    }
-
-    /* 코드 섹션 */
-    .text ALIGN(4K) : {
+    .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_VMA) {
         *(.text*)
-    }
+    } :text
 
-    /* 읽기 전용 데이터 */
-    .rodata ALIGN(4K) : {
+    .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_VMA) {
+        . = ALIGN(8);
+        KEEP(*(.limine_requests_start))
+        KEEP(*(.limine_requests))
+        KEEP(*(.limine_requests_end))
         *(.rodata*)
-    }
+        *(.eh_frame*)
+    } :rodata
 
-    /* 일반 데이터 */
-    .data ALIGN(4K) : {
+    .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_VMA) {
         *(.data*)
-    }
+    } :data
 
-    /* BSS 영역 (0 초기화 전역 변수 등) */
-    .bss ALIGN(4K) : {
-        __bss_start = .;     /* BSS 시작 주소 */
-
+    .bss ALIGN(4K) : AT(ADDR(.bss) - KERNEL_VMA) {
+        __bss_start = .;
         *(COMMON)
         *(.bss*)
         *(.sbss*)
         *(.gnu.linkonce.b*)
+        __bss_end = .;
+    } :data
 
-        __bss_end = .;       /* BSS 끝 주소 */
-    }
-
-    /* 커널 끝 주소 심볼 */
     _kernel_end = .;
 }

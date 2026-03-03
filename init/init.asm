@@ -1,40 +1,28 @@
-[BITS 32]
-ORG 0x500000
+[BITS 64]
 global _start
 
 section .text
 _start:
-    mov eax, 16 ; start orion-sysmgr
+    mov eax, 19
     int 0xA5
 
-    mov eax, 1
-    int 0xA5
-
-    mov eax, 11
+    mov eax, 259
     int 0xA5
     test eax, 1
     jz .skip_clear
 
-    mov eax, 3
+    mov eax, 64
     int 0xA5
 .skip_clear:
 
-    mov ebx, motd_path
-    mov eax, 17
+    lea rbx, [rel shell_path]
+    xor rcx, rcx
+    xor rdx, rdx
+    mov eax, 9
     int 0xA5
 
-    mov eax, 27
-    int 0xA5
-
-    mov ebx, shell_path
-    xor ecx, ecx
-    xor edx, edx
-    mov eax, 20
-    int 0xA5
-
-    ;mov eax, 8  ;exit
-    ;int 0xA5
+.hang:
+    jmp .hang
 
 section .rodata
-motd_path db "/system/config/motd.txt", 0
-shell_path db "/cmd/shell.sys", 0
+shell_path db "/cmd/login", 0

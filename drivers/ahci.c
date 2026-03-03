@@ -1,6 +1,6 @@
 #include "ahci.h"
 #include "hal.h"
-#include "screen.h"
+#include "../kernel/io/console.h"
 #include "../mm/paging.h"
 #include "../mm/mem.h"
 #include "../libc/string.h"
@@ -275,7 +275,7 @@ static bool ahci_build_prdt(void* buf, uint32_t bytes, hba_prdt_t* prdt, uint16_
         }
 
         uint32_t phys;
-        if (vmm_virt_to_phys((uint32_t)virt, &phys) != 0)
+        if (vmm_virt_to_phys((uint32_t)(uintptr_t)virt, &phys) != 0)
             phys = (uint32_t)virt;
 
         uint32_t page_off = phys & 0xFFFu;
@@ -376,7 +376,7 @@ static bool ahci_exec_cmd(ahci_ctrl_t* c, ahci_port_state_t* st, uint8_t cmd,
 }
 
 static inline hba_port_t* ahci_port_ptr(ahci_ctrl_t* c, uint8_t port_no) {
-    return (hba_port_t*)(c->base + AHCI_PORT_BASE + (uint32_t)port_no * AHCI_PORT_SIZE);
+    return (hba_port_t*)(uintptr_t)(c->base + AHCI_PORT_BASE + (uint32_t)port_no * AHCI_PORT_SIZE);
 }
 
 static bool ahci_port_present(hba_port_t* p) {
@@ -641,7 +641,7 @@ void ahci_pci_attach(uint8_t bus, uint8_t dev, uint8_t func,
     ahci_ctrl_t* c = &g_ahci[g_ahci_count++];
     memset(c, 0, sizeof(*c));
     c->base = mmio_base;
-    c->regs = (volatile uint32_t*)mmio_base;
+    c->regs = (volatile uint32_t*)(uintptr_t)mmio_base;
     c->irq_line = irq_line;
     c->bus = bus;
     c->dev = dev;

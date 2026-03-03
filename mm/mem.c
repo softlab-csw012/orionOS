@@ -2,7 +2,7 @@
 #include "paging.h"
 #include <stdint.h>
 #include <stddef.h>
-#include "../drivers/screen.h"
+#include "../kernel/io/console.h"
 
 #define ALIGN4(x)         (((x) + 3u) & ~3u)
 #define ALIGN_UP(x, a)    (((x) + ((a) - 1u)) & ~((a) - 1u))
@@ -255,10 +255,10 @@ void* kmalloc(size_t size, int align, uint32_t* phys_addr) {
 
     if (phys_addr) {
         uint32_t phys;
-        if (vmm_virt_to_phys((uint32_t)res, &phys) == 0)
+        if (vmm_virt_to_phys((uint32_t)(uintptr_t)res, &phys) == 0)
             *phys_addr = phys;
         else
-            *phys_addr = (uint32_t)res;
+            *phys_addr = (uint32_t)(uintptr_t)res;
     }
 
     return res;
@@ -266,6 +266,14 @@ void* kmalloc(size_t size, int align, uint32_t* phys_addr) {
 
 void* kmalloc_aligned(size_t size, size_t align) {
     return kmalloc_internal(size, align);
+}
+
+uintptr_t kmalloc_heap_base(void) {
+    return heap_base;
+}
+
+uintptr_t kmalloc_heap_commit_end(void) {
+    return heap_commit_end;
 }
 
 void kfree(void* ptr) {

@@ -2,7 +2,7 @@
 #include "pci.h"
 #include "hal.h"
 #include "../cpu/timer.h"
-#include "../drivers/screen.h"
+#include "../kernel/io/console.h"
 #include "../fs/fscmd.h"
 #include "../mm/mem.h"
 #include "../libc/string.h"

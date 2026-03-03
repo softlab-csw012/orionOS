@@ -1,5 +1,5 @@
 #include "ramdisk.h"
-#include "../drivers/screen.h"
+#include "../kernel/io/console.h"
 #include "../fs/disk.h"
 #include "../fs/fs_quick.h"
 #include "../libc/string.h"

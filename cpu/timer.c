@@ -3,9 +3,9 @@
 #include "ports.h"
 #include "../drivers/usb/usb.h"
 #include "../drivers/usb/uhci.h"
-#include "../drivers/screen.h"
 #include "../libc/function.h"
 #include "../kernel/proc/proc.h"
+#include "../kernel/tty.h"
 
 uint32_t tick = 0;
 static uint32_t timer_freq_hz = 100;
@@ -16,7 +16,7 @@ static uint32_t slice_pid = 0;
 
 static void timer_callback(registers_t *regs) {
     tick++;
-    screen_cursor_blink_tick();
+    tty_timer_tick();
     usb_poll();
     uhci_poll();
 
@@ -36,7 +36,10 @@ static void timer_callback(registers_t *regs) {
     slice_ticks++;
     if (slice_ticks >= PROC_TIME_SLICE_TICKS) {
         slice_ticks = 0;
-        proc_schedule(regs, true);
+
+        if (proc_schedule(regs, true)) {
+            return;
+        }
     }
 }
 

@@ -1,90 +1,102 @@
-; Defined in isr.c
+[bits 64]
+
 [extern isr_handler]
 [extern irq_handler]
 [extern sched_next_esp]
 
-; Common ISR code
+global switch_to
+
+%macro PUSH_GPRS 0
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rbp
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+%endmacro
+
+%macro POP_GPRS 0
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rbp
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+%endmacro
+
+%macro MAYBE_SWITCH_FRAME 0
+    mov rax, [rel sched_next_esp]
+    test rax, rax
+    jz %%no_switch
+    mov rsp, rax
+    mov qword [rel sched_next_esp], 0
+%%no_switch:
+%endmacro
+
+switch_to:
+    mov rsp, rdi
+    POP_GPRS
+    add rsp, 16
+    iretq
+
 isr_common_stub:
-    cli
-
-    pusha                  ; save all gp registers
-
-    mov ax, ds
-    push eax               ; save old ds
-
-    mov ax, 0x10           ; kernel data segment
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-
-    push esp               ; argument: pointer to registers_t
     cld
-    call isr_handler       ; call C-level ISR
+    PUSH_GPRS
+    mov rdi, rsp
+    call isr_handler
+    MAYBE_SWITCH_FRAME
+    POP_GPRS
+    add rsp, 16
+    iretq
 
-    add esp, 4             ; pop argument (registers_t pointer)
-
-    mov eax, [sched_next_esp]
-    test eax, eax
-    jz .no_sched_switch
-    mov dword [sched_next_esp], 0
-    mov esp, eax
-.no_sched_switch:
-
-    pop ebx                ; restore old ds
-    mov ds, bx
-    mov es, bx
-    mov fs, bx
-    mov gs, bx
-
-    popa
-
-    add esp, 8             ; pop error code + int number
-
-    sti
-    iret
-
-; Common IRQ code. Identical to ISR code except for the 'call' 
-; and the 'pop ebx'
 irq_common_stub:
-    cli
-    pusha
-    mov ax, ds
-    push eax
-    mov ax, 0x10
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-    push esp
     cld
+    PUSH_GPRS
+    mov rdi, rsp
     call irq_handler
-    add esp,4
+    MAYBE_SWITCH_FRAME
+    POP_GPRS
+    add rsp, 16
+    iretq
 
-    mov eax, [sched_next_esp]
-    test eax, eax
-    jz .no_irq_sched_switch
-    mov dword [sched_next_esp], 0
-    mov esp, eax
-.no_irq_sched_switch:
+%macro ISR_NOERR 2
+%1:
+    push qword 0
+    push qword %2
+    jmp isr_common_stub
+%endmacro
 
-    pop eax
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-    popa
-    add esp, 8
-    iret
-	
-; We don't get information about which interrupt was caller
-; when the handler is run, so we will need to have a different handler
-; for every interrupt.
-; Furthermore, some interrupts push an error code onto the stack but others
-; don't, so we will push a dummy error code for those which don't, so that
-; we have a consistent stack for all of them.
+%macro ISR_ERR 2
+%1:
+    push qword %2
+    jmp isr_common_stub
+%endmacro
 
-; First make the ISRs global
+%macro IRQ_STUB 2
+%1:
+    push qword 0
+    push qword %2
+    jmp irq_common_stub
+%endmacro
+
 global isr0
 global isr1
 global isr2
@@ -117,8 +129,7 @@ global isr28
 global isr29
 global isr30
 global isr31
-global isrA5 ; int A5h interrupt
-; IRQs
+global isrA5
 global irq0
 global irq1
 global irq2
@@ -136,276 +147,53 @@ global irq13
 global irq14
 global irq15
 
-; 0: Divide By Zero Exception
-isr0:
-    push byte 0
-    push byte 0
-    jmp isr_common_stub
+ISR_NOERR isr0, 0
+ISR_NOERR isr1, 1
+ISR_NOERR isr2, 2
+ISR_NOERR isr3, 3
+ISR_NOERR isr4, 4
+ISR_NOERR isr5, 5
+ISR_NOERR isr6, 6
+ISR_NOERR isr7, 7
+ISR_ERR   isr8, 8
+ISR_NOERR isr9, 9
+ISR_ERR   isr10, 10
+ISR_ERR   isr11, 11
+ISR_ERR   isr12, 12
+ISR_ERR   isr13, 13
+ISR_ERR   isr14, 14
+ISR_NOERR isr15, 15
+ISR_NOERR isr16, 16
+ISR_ERR   isr17, 17
+ISR_NOERR isr18, 18
+ISR_NOERR isr19, 19
+ISR_NOERR isr20, 20
+ISR_ERR   isr21, 21
+ISR_NOERR isr22, 22
+ISR_NOERR isr23, 23
+ISR_NOERR isr24, 24
+ISR_NOERR isr25, 25
+ISR_NOERR isr26, 26
+ISR_NOERR isr27, 27
+ISR_NOERR isr28, 28
+ISR_NOERR isr29, 29
+ISR_ERR   isr30, 30
+ISR_NOERR isr31, 31
+ISR_NOERR isrA5, 0xA5
 
-; 1: Debug Exception
-isr1:
-    push byte 0
-    push byte 1
-    jmp isr_common_stub
-
-; 2: Non Maskable Interrupt Exception
-isr2:
-    push byte 0
-    push byte 2
-    jmp isr_common_stub
-
-; 3: Int 3 Exception
-isr3:
-    push byte 0
-    push byte 3
-    jmp isr_common_stub
-
-; 4: INTO Exception
-isr4:
-    push byte 0
-    push byte 4
-    jmp isr_common_stub
-
-; 5: Out of Bounds Exception
-isr5:
-    push byte 0
-    push byte 5
-    jmp isr_common_stub
-
-; 6: Invalid Opcode Exception
-isr6:
-    push byte 0
-    push byte 6
-    jmp isr_common_stub
-
-; 7: Coprocessor Not Available Exception
-isr7:
-    push byte 0
-    push byte 7
-    jmp isr_common_stub
-
-; 8: Double Fault Exception (With Error Code!)
-isr8:
-    push byte 8
-    jmp isr_common_stub
-
-; 9: Coprocessor Segment Overrun Exception
-isr9:
-    push byte 0
-    push byte 9
-    jmp isr_common_stub
-
-; 10: Bad TSS Exception (With Error Code!)
-isr10:
-    push byte 10
-    jmp isr_common_stub
-
-; 11: Segment Not Present Exception (With Error Code!)
-isr11:
-    push byte 11
-    jmp isr_common_stub
-
-; 12: Stack Fault Exception (With Error Code!)
-isr12:
-    push byte 12
-    jmp isr_common_stub
-
-; 13: General Protection Fault Exception (With Error Code!)
-isr13:
-    push byte 13
-    jmp isr_common_stub
-
-; 14: Page Fault Exception (With Error Code!)
-isr14:
-    push byte 14
-    jmp isr_common_stub
-
-; 15: Reserved Exception
-isr15:
-    push byte 0
-    push byte 15
-    jmp isr_common_stub
-
-; 16: Floating Point Exception
-isr16:
-    push byte 0
-    push byte 16
-    jmp isr_common_stub
-
-; 17: Alignment Check Exception
-isr17:
-    push byte 0
-    push byte 17
-    jmp isr_common_stub
-
-; 18: Machine Check Exception
-isr18:
-    push byte 0
-    push byte 18
-    jmp isr_common_stub
-
-; 19: Reserved
-isr19:
-    push byte 0
-    push byte 19
-    jmp isr_common_stub
-
-; 20: Reserved
-isr20:
-    push byte 0
-    push byte 20
-    jmp isr_common_stub
-
-; 21: Reserved
-isr21:
-    push byte 0
-    push byte 21
-    jmp isr_common_stub
-
-; 22: Reserved
-isr22:
-    push byte 0
-    push byte 22
-    jmp isr_common_stub
-
-; 23: Reserved
-isr23:
-    push byte 0
-    push byte 23
-    jmp isr_common_stub
-
-; 24: Reserved
-isr24:
-    push byte 0
-    push byte 24
-    jmp isr_common_stub
-
-; 25: Reserved
-isr25:
-    push byte 0
-    push byte 25
-    jmp isr_common_stub
-
-; 26: Reserved
-isr26:
-    push byte 0
-    push byte 26
-    jmp isr_common_stub
-
-; 27: Reserved
-isr27:
-    push byte 0
-    push byte 27
-    jmp isr_common_stub
-
-; 28: Reserved
-isr28:
-    push byte 0
-    push byte 28
-    jmp isr_common_stub
-
-; 29: Reserved
-isr29:
-    push byte 0
-    push byte 29
-    jmp isr_common_stub
-
-; 30: Reserved
-isr30:
-    push byte 0
-    push byte 30
-    jmp isr_common_stub
-
-; 31: Reserved
-isr31:
-    push byte 0
-    push byte 31
-    jmp isr_common_stub
-
-; int A5h interrupt
-isrA5:
-    cli
-    push dword 0       ; error code dummy
-    push dword 0xA5    ; interrupt number
-    jmp isr_common_stub
-
-; IRQ handlers (remapped to 32–47)
-irq0:
-    push byte 0
-    push byte 32
-    jmp irq_common_stub
-
-irq1:
-    push byte 0
-    push byte 33
-    jmp irq_common_stub
-
-irq2:
-    push byte 0
-    push byte 34
-    jmp irq_common_stub
-
-irq3:
-    push byte 0
-    push byte 35
-    jmp irq_common_stub
-
-irq4:
-    push byte 0
-    push byte 36
-    jmp irq_common_stub
-
-irq5:
-    push byte 0
-    push byte 37
-    jmp irq_common_stub
-
-irq6:
-    push byte 0
-    push byte 38
-    jmp irq_common_stub
-
-irq7:
-    push byte 0
-    push byte 39
-    jmp irq_common_stub
-
-irq8:
-    push byte 0
-    push byte 40
-    jmp irq_common_stub
-
-irq9:
-    push byte 0
-    push byte 41
-    jmp irq_common_stub
-
-irq10:
-    push byte 0
-    push byte 42
-    jmp irq_common_stub
-
-irq11:
-    push byte 0
-    push byte 43
-    jmp irq_common_stub
-
-irq12:
-    push byte 0
-    push byte 44
-    jmp irq_common_stub
-
-irq13:
-    push byte 0
-    push byte 45
-    jmp irq_common_stub
-
-irq14:
-    push byte 0
-    push byte 46
-    jmp irq_common_stub
-
-irq15:
-    push byte 0
-    push byte 47
-    jmp irq_common_stub
+IRQ_STUB irq0, 32
+IRQ_STUB irq1, 33
+IRQ_STUB irq2, 34
+IRQ_STUB irq3, 35
+IRQ_STUB irq4, 36
+IRQ_STUB irq5, 37
+IRQ_STUB irq6, 38
+IRQ_STUB irq7, 39
+IRQ_STUB irq8, 40
+IRQ_STUB irq9, 41
+IRQ_STUB irq10, 42
+IRQ_STUB irq11, 43
+IRQ_STUB irq12, 44
+IRQ_STUB irq13, 45
+IRQ_STUB irq14, 46
+IRQ_STUB irq15, 47

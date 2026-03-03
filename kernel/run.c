@@ -1,6 +1,6 @@
 #include "run.h"
 #include "../fs/fscmd.h"
-#include "../drivers/screen.h"
+#include "io/console.h"
 #include "../drivers/ata.h"
 #include "../libc/string.h"
 #include "kernel.h"

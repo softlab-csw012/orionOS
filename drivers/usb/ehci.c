@@ -16,13 +16,13 @@ static int controller_count = 0;
 static volatile bool ehci_rescan_pending = false;
 #define EFLAGS_IF 0x200u
 
-static uint32_t irq_save(void) {
-    uint32_t flags = 0;
-    __asm__ volatile("pushf; pop %0; cli" : "=r"(flags) :: "memory");
+static uintptr_t irq_save(void) {
+    uintptr_t flags = 0;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     return flags;
 }
 
-static void irq_restore(uint32_t flags) {
+static void irq_restore(uintptr_t flags) {
     if (flags & EFLAGS_IF) {
         __asm__ volatile("sti" ::: "memory");
     }
@@ -37,7 +37,7 @@ static void ehci_rescan_work(void* ctx) {
 
 static void ehci_queue_rescan(void) {
     bool enqueue = false;
-    uint32_t flags = irq_save();
+    uintptr_t flags = irq_save();
     if (!ehci_rescan_pending) {
         ehci_rescan_pending = true;
         enqueue = true;
@@ -273,9 +273,9 @@ static const usb_hc_ops_t ehci_usbhc_ops = {
 
 static inline uint32_t phys_addr(void* p) {
     uint32_t phys;
-    if (vmm_virt_to_phys((uint32_t)p, &phys) == 0)
+    if (vmm_virt_to_phys((uint32_t)(uintptr_t)p, &phys) == 0)
         return phys;
-    kprintf("[EHCI] v2p failed for %08x\n", (uint32_t)p);
+    kprintf("[EHCI] v2p failed for %08lx\n", (unsigned long)(uintptr_t)p);
     return 0;
 }
 
@@ -332,7 +332,7 @@ static bool qtd_fill_bufs(ehci_qtd_t* qtd, void* buf, uint32_t len) {
     if (!buf || len == 0)
         return true;
 
-    uint32_t virt = (uint32_t)buf;
+    uint32_t virt = (uint32_t)(uintptr_t)buf;
     uint32_t offset = virt & 0xFFFu;
     uint32_t total = offset + len;
     uint32_t pages = (total + 0xFFFu) >> 12;
@@ -473,7 +473,7 @@ bool ehci_bulk_transfer(ehci_ctrl_t* hc, uint8_t addr, uint8_t ep, bool in,
 static bool ehci_reset_controller(ehci_ctrl_t* hc) {
     uint32_t cap0 = cap_rd(hc, CAP_CAPLENGTH);
     hc->cap_len = (uint8_t)(cap0 & 0xFF);
-    hc->op_regs = (volatile uint32_t*)((uint32_t)hc->cap_regs + hc->cap_len);
+    hc->op_regs = (volatile uint32_t*)(uintptr_t)((uintptr_t)hc->cap_regs + hc->cap_len);
 
     uint16_t ver = (uint16_t)((cap0 >> 16) & 0xFFFF);
     kprintf("[EHCI] Version %x caplen=%u\n", ver, hc->cap_len);
@@ -619,7 +619,7 @@ void ehci_pci_attach(uint8_t bus, uint8_t dev, uint8_t func,
     ehci_ctrl_t* hc = &controllers[idx];
     memset(hc, 0, sizeof(*hc));
     hc->base = mmio_base;
-    hc->cap_regs = (volatile uint32_t*)mmio_base;
+    hc->cap_regs = (volatile uint32_t*)(uintptr_t)mmio_base;
     hc->irq_line = irq_line;
     hc->next_addr = 1;
     hc->usbhc = &usbhc_wrappers[idx];

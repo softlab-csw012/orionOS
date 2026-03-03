@@ -126,13 +126,13 @@ static int controller_count = 0;
 static volatile bool xhci_rescan_pending = false;
 #define EFLAGS_IF 0x200u
 
-static uint32_t irq_save(void) {
-    uint32_t flags = 0;
-    __asm__ volatile("pushf; pop %0; cli" : "=r"(flags) :: "memory");
+static uintptr_t irq_save(void) {
+    uintptr_t flags = 0;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     return flags;
 }
 
-static void irq_restore(uint32_t flags) {
+static void irq_restore(uintptr_t flags) {
     if (flags & EFLAGS_IF) {
         __asm__ volatile("sti" ::: "memory");
     }
@@ -147,7 +147,7 @@ static void xhci_rescan_work(void* ctx) {
 
 static void xhci_queue_rescan(void) {
     bool enqueue = false;
-    uint32_t flags = irq_save();
+    uintptr_t flags = irq_save();
     if (!xhci_rescan_pending) {
         xhci_rescan_pending = true;
         enqueue = true;
@@ -161,8 +161,8 @@ static void xhci_queue_rescan(void) {
 
 static inline uint32_t phys_addr32(void* p) {
     uint32_t phys;
-    if (vmm_virt_to_phys((uint32_t)p, &phys) == 0) return phys;
-    return (uint32_t)p;
+    if (vmm_virt_to_phys((uint32_t)(uintptr_t)p, &phys) == 0) return phys;
+    return (uint32_t)(uintptr_t)p;
 }
 
 static inline void mmio_wr32(volatile uint32_t* base, uint32_t off, uint32_t v) {
@@ -210,7 +210,7 @@ static bool xhci_legacy_handoff(xhci_ctrl_t* x, uint32_t hcc1) {
     if (xecp == 0) return true;
 
     for (int hops = 0; hops < 64 && xecp >= 0x40; hops++) {
-        volatile uint32_t* cap = (volatile uint32_t*)(x->base + (xecp * 4u));
+        volatile uint32_t* cap = (volatile uint32_t*)(uintptr_t)(x->base + (xecp * 4u));
         uint32_t v = *cap;
         uint8_t cap_id = (uint8_t)(v & 0xFFu);
         uint32_t next = (v >> 8) & 0xFFu;
@@ -783,7 +783,7 @@ static bool xhci_ring_transfer(xhci_ctrl_t* x, xhci_dev_t* d, uint8_t dci,
         // Split at page boundaries (best-effort).
         uint32_t off = 0;
         while (off < len) {
-            uint32_t virt = (uint32_t)((uint8_t*)data + off);
+            uint32_t virt = (uint32_t)(uintptr_t)((uint8_t*)data + off);
             uint32_t phys;
             if (vmm_virt_to_phys(virt, &phys) != 0) phys = virt;
             uint32_t page_off = phys & 0xFFFu;
@@ -891,7 +891,7 @@ static bool xhci_usbhc_control_transfer(usb_hc_t* hc, uint32_t dev, uint8_t ep,
         // Best-effort: split at page boundaries using multiple Data Stage TRBs.
         uint32_t off = 0;
         while (off < len) {
-            uint32_t virt = (uint32_t)((uint8_t*)data + off);
+            uint32_t virt = (uint32_t)(uintptr_t)((uint8_t*)data + off);
             uint32_t phys;
             if (vmm_virt_to_phys(virt, &phys) != 0) phys = virt;
             uint32_t page_off = phys & 0xFFFu;
@@ -1373,12 +1373,12 @@ static void xhci_scan_ports(xhci_ctrl_t* x, bool verbose) {
 static bool xhci_init(xhci_ctrl_t* x) {
     map_mmio(x->base, 0x20000u);
 
-    x->cap = (volatile uint8_t*)x->base;
+    x->cap = (volatile uint8_t*)(uintptr_t)x->base;
     x->cap_len = x->cap[XHCI_CAPLENGTH];
-    uint32_t hcs1 = *(volatile uint32_t*)(x->base + XHCI_HCSPARAMS1);
-    uint32_t hcc1 = *(volatile uint32_t*)(x->base + XHCI_HCCPARAMS1);
-    uint32_t dboff = *(volatile uint32_t*)(x->base + XHCI_DBOFF);
-    uint32_t rtsoff = *(volatile uint32_t*)(x->base + XHCI_RTSOFF);
+    uint32_t hcs1 = *(volatile uint32_t*)(uintptr_t)(x->base + XHCI_HCSPARAMS1);
+    uint32_t hcc1 = *(volatile uint32_t*)(uintptr_t)(x->base + XHCI_HCCPARAMS1);
+    uint32_t dboff = *(volatile uint32_t*)(uintptr_t)(x->base + XHCI_DBOFF);
+    uint32_t rtsoff = *(volatile uint32_t*)(uintptr_t)(x->base + XHCI_RTSOFF);
 
     if (!xhci_legacy_handoff(x, hcc1))
         return false;
@@ -1388,9 +1388,9 @@ static bool xhci_init(xhci_ctrl_t* x) {
     x->max_ports = (uint8_t)((hcs1 >> 24) & 0xFFu);
     x->ctx_size = (hcc1 & (1u << 2)) ? 64 : 32;
 
-    x->op = (volatile uint32_t*)(x->base + x->cap_len);
-    x->db = (volatile uint32_t*)(x->base + (dboff & ~0x3u));
-    x->rt = (volatile uint32_t*)(x->base + (rtsoff & ~0x1Fu));
+    x->op = (volatile uint32_t*)(uintptr_t)(x->base + x->cap_len);
+    x->db = (volatile uint32_t*)(uintptr_t)(x->base + (dboff & ~0x3u));
+    x->rt = (volatile uint32_t*)(uintptr_t)(x->base + (rtsoff & ~0x1Fu));
 
     kprintf("[xHCI] caplen=%u max_slots=%u max_ports=%u ctx=%u\n",
             x->cap_len, x->max_slots, x->max_ports, x->ctx_size);

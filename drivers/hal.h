@@ -12,6 +12,8 @@ void hal_out32(uint16_t port, uint32_t data);
 
 void hal_enable_interrupts(void);
 void hal_disable_interrupts(void);
+void cli(void);
+void sti(void);
 void hal_halt(void);
 void hal_wait_for_interrupt(void);
 void hal_pause(void);

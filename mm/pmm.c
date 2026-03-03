@@ -1,6 +1,7 @@
 // mm/pmm.c
 #include "pmm.h"
-#include "../drivers/screen.h"
+#include "../kernel/limine.h"
+#include "../kernel/io/console.h"
 #include "../kernel/multiboot.h"
 #include "../libc/string.h"
 
@@ -51,37 +52,61 @@ void pmm_init(uint32_t mb_info_addr){
     free_memory =0;
     max_physical_page =0;
 
-    multiboot_info_t* mbi = (multiboot_info_t*)mb_info_addr;
-
     kprint("[PMM] Parsing memory map...\n");
 
-    // ----- usable 영역만 free로 설정 -----
-    for(multiboot_tag_t* tag = mbi->first_tag;
-        tag->type != 0;
-        tag = (multiboot_tag_t*)((uint8_t*)tag + ((tag->size+7)&~7))){
+    if (limine_memmap_response) {
+        volatile limine_memmap_response_t* resp = limine_memmap_response;
+        for (uint64_t i = 0; i < resp->entry_count; i++) {
+            limine_memmap_entry_t* e = resp->entries[i];
+            if (!e || e->type != LIMINE_MEMMAP_USABLE) {
+                continue;
+            }
 
-        if(tag->type == MULTIBOOT_TAG_TYPE_MMAP){
-            multiboot_tag_mmap_t* mmap = (multiboot_tag_mmap_t*)tag;
-            uint32_t entries = (mmap->size - sizeof(*mmap)) / mmap->entry_size;
+            uint64_t start = e->base;
+            uint64_t end = e->base + e->length;
+            uint64_t s = start / PAGE_SIZE;
+            uint64_t en = end / PAGE_SIZE;
 
-            for(uint32_t i=0;i<entries;i++){
-                multiboot_mmap_entry_t* e =
-                    (multiboot_mmap_entry_t*)((uint8_t*)mmap->entries + i*mmap->entry_size);
+            if (en > max_physical_page) {
+                max_physical_page = en;
+            }
 
-                if(e->type == 1){
-                    uint64_t start = e->addr;
-                    uint64_t end   = e->addr + e->len;
+            for (uint64_t p = s; p < en && p < MAX_PAGES; p++) {
+                mark_free(p);
+            }
+            free_memory += e->length;
+            total_memory += e->length;
+        }
+    } else {
+        multiboot_info_t* mbi = (multiboot_info_t*)(uintptr_t)mb_info_addr;
 
-                    uint64_t s = start / PAGE_SIZE;
-                    uint64_t en = end   / PAGE_SIZE;
+        for(multiboot_tag_t* tag = mbi->first_tag;
+            tag->type != 0;
+            tag = (multiboot_tag_t*)((uint8_t*)tag + ((tag->size+7)&~7))){
 
-                    if(en > max_physical_page) max_physical_page = en;
+            if(tag->type == MULTIBOOT_TAG_TYPE_MMAP){
+                multiboot_tag_mmap_t* mmap = (multiboot_tag_mmap_t*)tag;
+                uint32_t entries = (mmap->size - sizeof(*mmap)) / mmap->entry_size;
 
-                    for(uint64_t p = s; p < en && p < MAX_PAGES; p++){
-                        mark_free(p);
+                for(uint32_t i=0;i<entries;i++){
+                    multiboot_mmap_entry_t* e =
+                        (multiboot_mmap_entry_t*)((uint8_t*)mmap->entries + i*mmap->entry_size);
+
+                    if(e->type == 1){
+                        uint64_t start = e->addr;
+                        uint64_t end   = e->addr + e->len;
+
+                        uint64_t s = start / PAGE_SIZE;
+                        uint64_t en = end   / PAGE_SIZE;
+
+                        if(en > max_physical_page) max_physical_page = en;
+
+                        for(uint64_t p = s; p < en && p < MAX_PAGES; p++){
+                            mark_free(p);
+                        }
+                        free_memory  += e->len;
+                        total_memory += e->len;
                     }
-                    free_memory  += e->len;
-                    total_memory += e->len;
                 }
             }
         }
@@ -92,19 +117,28 @@ void pmm_init(uint32_t mb_info_addr){
 
     // ----- 커널 보호 -----
     extern uint32_t _kernel_start, _kernel_end;
-    pmm_reserve_region((uint32_t)&_kernel_start, (uint32_t)&_kernel_end);
+    pmm_reserve_region((uint32_t)(uintptr_t)&_kernel_start, (uint32_t)(uintptr_t)&_kernel_end);
 
-    // ----- Multiboot info 전체 보호 -----
-    pmm_reserve_region(mb_info_addr, mb_info_addr + mbi->total_size);
+    if (limine_module_response) {
+        volatile limine_module_response_t* mod_resp = limine_module_response;
+        for (uint64_t i = 0; i < mod_resp->module_count; i++) {
+            limine_file_t* mod = mod_resp->modules[i];
+            uintptr_t start = (uintptr_t)mod->address;
+            uintptr_t end = start + (uintptr_t)mod->size;
+            pmm_reserve_region((uint32_t)start, (uint32_t)end);
+        }
+    } else if (mb_info_addr) {
+        multiboot_info_t* mbi = (multiboot_info_t*)(uintptr_t)mb_info_addr;
+        pmm_reserve_region(mb_info_addr, mb_info_addr + mbi->total_size);
 
-    // ----- Multiboot modules (init.sys 등) 보호 -----
-    for(multiboot_tag_t* tag = mbi->first_tag;
-        tag->type != 0;
-        tag = (multiboot_tag_t*)((uint8_t*)tag + ((tag->size+7)&~7))){
+        for(multiboot_tag_t* tag = mbi->first_tag;
+            tag->type != 0;
+            tag = (multiboot_tag_t*)((uint8_t*)tag + ((tag->size+7)&~7))){
 
-        if(tag->type == MULTIBOOT_TAG_TYPE_MODULE){
-            multiboot_tag_module_t* mod = (multiboot_tag_module_t*)tag;
-            pmm_reserve_region(mod->mod_start, mod->mod_end);
+            if(tag->type == MULTIBOOT_TAG_TYPE_MODULE){
+                multiboot_tag_module_t* mod = (multiboot_tag_module_t*)tag;
+                pmm_reserve_region(mod->mod_start, mod->mod_end);
+            }
         }
     }
 
@@ -122,11 +156,11 @@ void* pmm_alloc_page(){
     }
     mark_used(idx);
     free_memory -= PAGE_SIZE;
-    return (void*)(idx * PAGE_SIZE);
+    return (void*)((uintptr_t)idx * PAGE_SIZE);
 }
 
 void pmm_free_page(void* addr){
-    uint64_t idx = (uint32_t)addr / PAGE_SIZE;
+    uint64_t idx = (uintptr_t)addr / PAGE_SIZE;
     if(idx >= max_physical_page) return;
 
     if(BIT_TEST(pmm_bitmap, idx)){

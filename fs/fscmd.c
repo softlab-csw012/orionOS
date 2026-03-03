@@ -3,8 +3,9 @@
 #include "fat32.h"
 #include "xvfs.h"
 #include "disk.h"
-#include "../drivers/screen.h"
-#include "../drivers/ata.h"
+#include "../kernel/devfs.h"
+#include "../kernel/io/console.h"
+#include "../drivers/blockdev.h"
 #include "../libc/string.h"
 #include "../kernel/kernel.h"
 #include "../mm/mem.h"
@@ -15,6 +16,12 @@ int current_drive = -1;
 
 extern DiskInfo disks[MAX_DISKS];   // disk_t 대신 DiskInfo
 char current_path[256] = "/";
+static uint32_t fat_mount_owner_uid = 0;
+static uint32_t fat_mount_owner_gid = 0;
+static uint8_t fat_mount_mode = FSCMD_MODE_OWNER_RW;
+static bool single_root_mode = true;
+#define FSCMD_MAX_MOUNTS 8
+static fscmd_mount_info_t g_mounts[FSCMD_MAX_MOUNTS];
 
 static bool write_progress_active = false;
 static uint32_t write_progress_total = 0;
@@ -71,14 +78,523 @@ typedef struct __attribute__((packed)) {
     uint32_t sectors;
 } MBRPart;
 
+typedef struct {
+    fs_type_t fs;
+    int drive;
+    char abs_path[256];
+    char subpath[256];
+} fscmd_resolved_path_t;
+
+static bool fscmd_parse_drive_prefix(const char* path, int* out_drive, const char** out_subpath);
+
+static fs_type_t fscmd_fs_from_disk_type(const char* type) {
+    if (!type) return FS_NONE;
+    if (strcmp(type, "FAT16") == 0) return FS_FAT16;
+    if (strcmp(type, "FAT32") == 0) return FS_FAT32;
+    if (strcmp(type, "XVFS") == 0) return FS_XVFS;
+    return FS_NONE;
+}
+
+static void fscmd_normalize_mount_target(const char* in, char* out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!in || in[0] != '/') {
+        return;
+    }
+    if (in[1] == '\0') {
+        strcpy(out, "/");
+        return;
+    }
+
+    size_t n = strlen(in);
+    while (n > 1 && in[n - 1] == '/') {
+        n--;
+    }
+    if (n >= out_len) {
+        n = out_len - 1;
+    }
+    memcpy(out, in, n);
+    out[n] = '\0';
+}
+
+static int fscmd_find_mount_target(const char* target) {
+    if (!target) return -1;
+    for (int i = 0; i < FSCMD_MAX_MOUNTS; i++) {
+        if (g_mounts[i].target[0] == '\0') continue;
+        if (strcmp(g_mounts[i].target, target) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool fscmd_mount_target_matches(const char* abs_path, const char* target, size_t* out_len) {
+    if (!abs_path || !target || target[0] != '/') {
+        return false;
+    }
+    if (strcmp(target, "/") == 0) {
+        if (out_len) *out_len = 1;
+        return true;
+    }
+    size_t tlen = strlen(target);
+    if (strncmp(abs_path, target, tlen) != 0) {
+        return false;
+    }
+    if (abs_path[tlen] != '\0' && abs_path[tlen] != '/') {
+        return false;
+    }
+    if (out_len) *out_len = tlen;
+    return true;
+}
+
+static int fscmd_alloc_mount_slot(void) {
+    for (int i = 0; i < FSCMD_MAX_MOUNTS; i++) {
+        if (g_mounts[i].target[0] == '\0') {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool fscmd_has_live_mount(fs_type_t fs, int drive) {
+    for (int i = 0; i < FSCMD_MAX_MOUNTS; i++) {
+        if (g_mounts[i].target[0] == '\0') {
+            continue;
+        }
+        if (g_mounts[i].fs == fs && g_mounts[i].drive == drive) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void fscmd_normalize_path(const char* input, char* out, size_t out_len) {
+    char parts[64][64];
+    int depth = 0;
+
+    if (!out || out_len == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!input || input[0] == '\0') {
+        strcpy(out, "/");
+        return;
+    }
+
+    const char* p = input;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+
+        char part[64];
+        int len = 0;
+        while (*p && *p != '/' && len < (int)sizeof(part) - 1) {
+            part[len++] = *p++;
+        }
+        part[len] = '\0';
+
+        if (strcmp(part, ".") == 0) {
+            continue;
+        }
+        if (strcmp(part, "..") == 0) {
+            if (depth > 0) depth--;
+            continue;
+        }
+        if (depth < (int)(sizeof(parts) / sizeof(parts[0]))) {
+            strncpy(parts[depth], part, sizeof(parts[depth]) - 1);
+            parts[depth][sizeof(parts[depth]) - 1] = '\0';
+            depth++;
+        }
+    }
+
+    if (depth == 0) {
+        strcpy(out, "/");
+        return;
+    }
+
+    size_t used = 0;
+    out[used++] = '/';
+    for (int i = 0; i < depth; i++) {
+        size_t plen = strlen(parts[i]);
+        if (used + plen + 1 >= out_len) {
+            break;
+        }
+        memcpy(out + used, parts[i], plen);
+        used += plen;
+        if (i != depth - 1) {
+            out[used++] = '/';
+        }
+    }
+    out[used] = '\0';
+}
+
+static bool fscmd_make_absolute_path(const char* path, char* out, size_t out_len) {
+    char raw[256];
+    if (!out || out_len == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+    if (!path || path[0] == '\0') {
+        path = current_path;
+    }
+
+    if (!path || path[0] == '\0') {
+        strcpy(out, "/");
+        return true;
+    }
+
+    if (path[0] == '/') {
+        strncpy(raw, path, sizeof(raw) - 1);
+        raw[sizeof(raw) - 1] = '\0';
+    } else {
+        const char* cwd = current_path[0] ? current_path : "/";
+        int n = snprintf(raw, sizeof(raw), "%s%s%s",
+                         cwd,
+                         (cwd[strlen(cwd) - 1] == '/') ? "" : "/",
+                         path);
+        if (n <= 0 || (size_t)n >= sizeof(raw)) {
+            return false;
+        }
+    }
+
+    fscmd_normalize_path(raw, out, out_len);
+    return true;
+}
+
+static bool fscmd_resolve_path(const char* path, fscmd_resolved_path_t* out) {
+    if (!out) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->drive = -1;
+
+    int path_drive = -1;
+    const char* pref = NULL;
+    if (fscmd_parse_drive_prefix(path, &path_drive, &pref)) {
+        fs_type_t fs = fscmd_fs_from_disk_type(disks[path_drive].fs_type);
+        if (fs == FS_NONE) {
+            return false;
+        }
+        char abs[256];
+        if (!pref || pref[0] == '\0') {
+            strcpy(abs, "/");
+        } else if (pref[0] == '/') {
+            strncpy(abs, pref, sizeof(abs) - 1);
+            abs[sizeof(abs) - 1] = '\0';
+        } else {
+            int n = snprintf(abs, sizeof(abs), "/%s", pref);
+            if (n <= 0 || (size_t)n >= sizeof(abs)) {
+                return false;
+            }
+        }
+        fscmd_normalize_path(abs, out->abs_path, sizeof(out->abs_path));
+        strncpy(out->subpath, out->abs_path, sizeof(out->subpath) - 1);
+        out->subpath[sizeof(out->subpath) - 1] = '\0';
+        out->fs = fs;
+        out->drive = path_drive;
+        return true;
+    }
+
+    if (!fscmd_make_absolute_path(path, out->abs_path, sizeof(out->abs_path))) {
+        return false;
+    }
+
+    int best = -1;
+    size_t best_len = 0;
+    for (int i = 0; i < FSCMD_MAX_MOUNTS; i++) {
+        if (g_mounts[i].target[0] == '\0') {
+            continue;
+        }
+        size_t mlen = 0;
+        if (!fscmd_mount_target_matches(out->abs_path, g_mounts[i].target, &mlen)) {
+            continue;
+        }
+        if (best < 0 || mlen > best_len) {
+            best = i;
+            best_len = mlen;
+        }
+    }
+    if (best < 0) {
+        return false;
+    }
+
+    out->fs = g_mounts[best].fs;
+    out->drive = g_mounts[best].drive;
+    if (best_len <= 1) {
+        strncpy(out->subpath, out->abs_path, sizeof(out->subpath) - 1);
+        out->subpath[sizeof(out->subpath) - 1] = '\0';
+    } else {
+        const char* rem = out->abs_path + best_len;
+        if (*rem == '\0') {
+            strcpy(out->subpath, "/");
+        } else {
+            strncpy(out->subpath, rem, sizeof(out->subpath) - 1);
+            out->subpath[sizeof(out->subpath) - 1] = '\0';
+        }
+    }
+    if (out->subpath[0] == '\0') {
+        strcpy(out->subpath, "/");
+    }
+    return true;
+}
+
+static void fscmd_sync_legacy_root_mount(void) {
+    int idx = fscmd_find_mount_target("/");
+    if (idx < 0) {
+        current_drive = -1;
+        current_fs = FS_NONE;
+        return;
+    }
+    current_drive = g_mounts[idx].drive;
+    current_fs = g_mounts[idx].fs;
+}
+
+static bool fscmd_mount_backend(fs_type_t fs, int drive, uint32_t base_lba) {
+    if (fscmd_has_live_mount(fs, drive)) {
+        return true;
+    }
+    switch (fs) {
+        case FS_DEVFS:
+            return true;
+        case FS_FAT16:
+            return fat16_init((uint8_t)drive, base_lba);
+        case FS_FAT32:
+            return fat32_init((uint8_t)drive, base_lba);
+        case FS_XVFS:
+            return xvfs_init((uint8_t)drive, base_lba);
+        default:
+            return false;
+    }
+}
+
+bool fscmd_mount_drive_at(int drive, const char* target) {
+    if (drive < 0 || drive >= MAX_DISKS) {
+        return false;
+    }
+    if (!disks[drive].present) {
+        return false;
+    }
+    if (!target || target[0] != '/') {
+        return false;
+    }
+    char norm_target[32];
+    fscmd_normalize_mount_target(target, norm_target, sizeof(norm_target));
+    if (norm_target[0] == '\0') {
+        return false;
+    }
+
+    fs_type_t fs = fscmd_fs_from_disk_type(disks[drive].fs_type);
+    if (fs == FS_NONE) {
+        return false;
+    }
+    if (!fscmd_mount_backend(fs, drive, disks[drive].base_lba)) {
+        return false;
+    }
+
+    int idx = fscmd_find_mount_target(norm_target);
+    if (idx < 0) {
+        idx = fscmd_alloc_mount_slot();
+        if (idx < 0) {
+            return false;
+        }
+    }
+
+    g_mounts[idx].fs = fs;
+    g_mounts[idx].drive = drive;
+    strncpy(g_mounts[idx].target, norm_target, sizeof(g_mounts[idx].target) - 1);
+    g_mounts[idx].target[sizeof(g_mounts[idx].target) - 1] = '\0';
+
+    fscmd_sync_legacy_root_mount();
+    if (strcmp(norm_target, "/") == 0) {
+        fscmd_reset_path();
+    }
+    return true;
+}
+
+bool fscmd_mount_devfs_at(const char* target) {
+    if (!target || target[0] != '/') {
+        return false;
+    }
+    char norm_target[32];
+    fscmd_normalize_mount_target(target, norm_target, sizeof(norm_target));
+    if (norm_target[0] == '\0') {
+        return false;
+    }
+
+    int idx = fscmd_find_mount_target(norm_target);
+    if (idx < 0) {
+        idx = fscmd_alloc_mount_slot();
+        if (idx < 0) {
+            return false;
+        }
+    }
+
+    g_mounts[idx].fs = FS_DEVFS;
+    g_mounts[idx].drive = -1;
+    strncpy(g_mounts[idx].target, norm_target, sizeof(g_mounts[idx].target) - 1);
+    g_mounts[idx].target[sizeof(g_mounts[idx].target) - 1] = '\0';
+    return true;
+}
+
+bool fscmd_unmount(const char* target) {
+    char norm_target[32];
+    fscmd_normalize_mount_target(target, norm_target, sizeof(norm_target));
+    int idx = fscmd_find_mount_target(norm_target);
+    if (idx < 0) {
+        return false;
+    }
+    memset(&g_mounts[idx], 0, sizeof(g_mounts[idx]));
+    fscmd_sync_legacy_root_mount();
+    if (current_fs == FS_NONE) {
+        strcpy(current_path, "/");
+    }
+    return true;
+}
+
+void fscmd_clear_mounts(void) {
+    memset(g_mounts, 0, sizeof(g_mounts));
+    fat16_drive = -1;
+    fat32_drive = (uint8_t)-1;
+    xvfs_drive = (uint8_t)-1;
+    current_drive = -1;
+    current_fs = FS_NONE;
+    strcpy(current_path, "/");
+}
+
+int fscmd_list_mounts(fscmd_mount_info_t* out, int max_entries) {
+    if (!out || max_entries <= 0) {
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < FSCMD_MAX_MOUNTS && n < max_entries; i++) {
+        if (g_mounts[i].target[0] == '\0') {
+            continue;
+        }
+        out[n++] = g_mounts[i];
+    }
+    return n;
+}
+
 const char* fs_to_string(fs_type_t type) {
     switch (type) {
         case FS_NONE:  return "NONE";
+        case FS_DEVFS: return "DEVFS";
         case FS_FAT16: return "FAT16";
         case FS_FAT32: return "FAT32";
         case FS_XVFS:  return "XVFS";
         default:       return "UNKNOWN";
     }
+}
+
+static bool fscmd_parse_drive_prefix(const char* path, int* out_drive, const char** out_subpath) {
+    if (single_root_mode) {
+        return false;
+    }
+    if (!path || !*path) {
+        return false;
+    }
+    int i = 0;
+    int drive = 0;
+    while (path[i] >= '0' && path[i] <= '9') {
+        drive = drive * 10 + (path[i] - '0');
+        i++;
+    }
+    if (i == 0 || path[i] != '#') {
+        return false;
+    }
+    if (drive < 0 || drive >= MAX_DISKS) {
+        return false;
+    }
+    if (!disks[drive].present) {
+        return false;
+    }
+    if (out_drive) {
+        *out_drive = drive;
+    }
+    if (out_subpath) {
+        *out_subpath = (path[i + 1] != '\0') ? (path + i + 1) : "/";
+    }
+    return true;
+}
+
+void fscmd_set_single_root_mode(bool enabled) {
+    single_root_mode = enabled;
+}
+
+bool fscmd_get_single_root_mode(void) {
+    return single_root_mode;
+}
+
+void fscmd_set_fat_mount_policy(uint32_t owner_uid, uint32_t owner_gid, uint8_t mode) {
+    fat_mount_owner_uid = owner_uid;
+    fat_mount_owner_gid = owner_gid;
+    fat_mount_mode = mode & FSCMD_MODE_OWNER_RW;
+}
+
+void fscmd_get_fat_mount_policy(uint32_t* out_owner_uid, uint32_t* out_owner_gid, uint8_t* out_mode) {
+    if (out_owner_uid) *out_owner_uid = fat_mount_owner_uid;
+    if (out_owner_gid) *out_owner_gid = fat_mount_owner_gid;
+    if (out_mode) *out_mode = fat_mount_mode;
+}
+
+bool fscmd_get_path_meta(const char* path, uint32_t* out_owner_uid, uint32_t* out_owner_gid, uint8_t* out_mode) {
+    if (!out_owner_uid || !out_owner_gid || !out_mode) {
+        return false;
+    }
+
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(path, &rp)) {
+        return false;
+    }
+
+    if (rp.fs == FS_FAT16 || rp.fs == FS_FAT32) {
+        *out_owner_uid = fat_mount_owner_uid;
+        *out_owner_gid = fat_mount_owner_gid;
+        *out_mode = fat_mount_mode;
+        return true;
+    }
+
+    if (rp.fs == FS_DEVFS) {
+        *out_owner_uid = 0;
+        *out_owner_gid = 0;
+        *out_mode = FSCMD_MODE_OWNER_RW;
+        return true;
+    }
+
+    if (rp.fs == FS_XVFS) {
+        if (!fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
+            return false;
+        }
+        XVFS_FileEntry e;
+        if (rp.subpath[0] && xvfs_find_entry(rp.subpath, &e)) {
+            *out_owner_uid = 0;
+            *out_owner_gid = 0;
+            *out_mode = FSCMD_MODE_OWNER_RW;
+            return true;
+        }
+        *out_owner_uid = 0;
+        *out_owner_gid = 0;
+        *out_mode = FSCMD_MODE_OWNER_RW;
+        return true;
+    }
+
+    return false;
+}
+
+bool fscmd_resolve_devfs_path(const char* path, char* out_subpath, size_t out_len) {
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(path, &rp) || rp.fs != FS_DEVFS) {
+        return false;
+    }
+    if (!out_subpath || out_len == 0) {
+        return true;
+    }
+    strncpy(out_subpath, rp.subpath, out_len - 1);
+    out_subpath[out_len - 1] = '\0';
+    return true;
 }
 
 void fscmd_reset_path(void) {
@@ -96,17 +612,35 @@ void fscmd_reset_path(void) {
 // ls 명령어 (FAT16 / FAT32 공통)
 // ─────────────────────────────
 void fscmd_ls(const char* path) {
-    if (current_fs == FS_FAT16) {
-        fat16_ls(path);
-    } 
-    else if (current_fs == FS_FAT32) {
-        fat32_ls(path);
-    } 
-    else if (current_fs == FS_XVFS) {
-        xvfs_ls(path);
-    } 
-    else {
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(path, &rp)) {
         kprint("No filesystem mounted.\n");
+        return;
+    }
+    if (rp.fs != FS_DEVFS &&
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
+        kprint("No filesystem mounted.\n");
+        return;
+    }
+
+    if (rp.fs == FS_FAT16) {
+        fat16_ls(rp.subpath);
+    } else if (rp.fs == FS_FAT32) {
+        fat32_ls(rp.subpath);
+    } else if (rp.fs == FS_XVFS) {
+        xvfs_ls(rp.subpath);
+    } else if (rp.fs == FS_DEVFS) {
+        char names[128 * 48];
+        uint8_t is_dir[128];
+        int count = devfs_list_subpath(rp.subpath, names, is_dir, 128, 48);
+        if (count < 0) {
+            kprint("Not a directory.\n");
+            return;
+        }
+        for (int i = 0; i < count; i++) {
+            kprint(&names[i * 48]);
+            kprint("\n");
+        }
     }
 }
 
@@ -114,34 +648,32 @@ int fscmd_list_dir(const char* path, char* names, uint8_t* is_dir, uint32_t max_
     if (!names || !is_dir || max_entries == 0 || name_len == 0) {
         return -1;
     }
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(path, &rp)) {
+        return -1;
+    }
+    if (rp.fs != FS_DEVFS &&
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
+        return -1;
+    }
 
-    if (current_fs == FS_FAT16) {
-        uint16_t cluster;
-        if (!path || path[0] == '\0') {
-            cluster = current_dir_cluster16;
-        } else {
-            cluster = fat16_resolve_dir(path);
-            if (cluster == 0xFFFF) {
-                return -1;
-            }
+    if (rp.fs == FS_FAT16) {
+        uint16_t cluster = fat16_resolve_dir(rp.subpath);
+        if (cluster == 0xFFFF) {
+            return -1;
         }
         return fat16_list_dir_lfn(cluster, names, (bool*)is_dir, (int)max_entries, name_len);
     }
 
-    if (current_fs == FS_FAT32) {
-        uint32_t cluster;
-        if (!path || path[0] == '\0') {
-            cluster = current_dir_cluster32;
-        } else {
-            cluster = fat32_resolve_dir(path);
-            if (cluster < 2 || cluster >= 0x0FFFFFF8) {
-                return -1;
-            }
+    if (rp.fs == FS_FAT32) {
+        uint32_t cluster = fat32_resolve_dir(rp.subpath);
+        if (cluster < 2 || cluster >= 0x0FFFFFF8) {
+            return -1;
         }
         return fat32_list_dir_lfn(cluster, names, (bool*)is_dir, (int)max_entries, name_len);
     }
 
-    if (current_fs == FS_XVFS) {
+    if (rp.fs == FS_XVFS) {
         if (max_entries > 256) {
             max_entries = 256;
         }
@@ -149,7 +681,7 @@ int fscmd_list_dir(const char* path, char* names, uint8_t* is_dir, uint32_t max_
         if (!entries) {
             return -1;
         }
-        int count = xvfs_read_dir_entries(path, entries, max_entries);
+        int count = xvfs_read_dir_entries(rp.subpath, entries, max_entries);
         if (count < 0) {
             kfree(entries);
             return -1;
@@ -163,40 +695,38 @@ int fscmd_list_dir(const char* path, char* names, uint8_t* is_dir, uint32_t max_
         kfree(entries);
         return count;
     }
-
-    kprint("No filesystem mounted.\n");
+    if (rp.fs == FS_DEVFS) {
+        return devfs_list_subpath(rp.subpath, names, is_dir, max_entries, name_len);
+    }
     return -1;
 }
 
 void fscmd_cat(const char* path) {
-    if (current_fs == FS_FAT16) {
-        fat16_cat(path);
-    } 
-    else if (current_fs == FS_FAT32) {
-        fat32_cat(path);
-    } 
-    else if (current_fs == FS_XVFS) {
-        xvfs_cat(path);
-    } 
-    else {
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(path, &rp) ||
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
         kprint("No filesystem mounted.\n");
+        return;
+    }
+    if (rp.fs == FS_FAT16) {
+        fat16_cat(rp.subpath);
+    } else if (rp.fs == FS_FAT32) {
+        fat32_cat(rp.subpath);
+    } else if (rp.fs == FS_XVFS) {
+        xvfs_cat(rp.subpath);
     }
 }
 
 bool fscmd_rm(const char* path) {
-    if (current_fs == FS_FAT16) {
-        return fat16_rm(path);
-    } 
-    else if (current_fs == FS_FAT32) {
-        return fat32_rm(path);
-    } 
-    else if (current_fs == FS_XVFS) {
-        return xvfs_rm(path);
-    } 
-    else {
-        kprint("No filesystem mounted.\n");
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(path, &rp) ||
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
         return false;
     }
+    if (rp.fs == FS_FAT16) return fat16_rm(rp.subpath);
+    if (rp.fs == FS_FAT32) return fat32_rm(rp.subpath);
+    if (rp.fs == FS_XVFS) return xvfs_rm(rp.subpath);
+    return false;
 }
 
 void fscmd_write_progress_begin(const char* label, uint32_t total) {
@@ -297,176 +827,269 @@ void fscmd_write_progress_finish(bool success) {
 }
 
 bool fscmd_write_file(const char* filename, const char* data, uint32_t len) {
-    const char* fs = disks[current_drive].fs_type;
-
-    //kprintf("[DEBUG] fscmd_write_file(): drive=%d, fs=%s\n",
-    //        current_drive, fs);
-
-    if (strcmp(fs, "FAT16") == 0) {
-        int written = fat16_write_file(filename, data, (int)len);
-        return written >= 0;
-    } else if (strcmp(fs, "FAT32") == 0) {
-        return fat32_write_file(filename, (const uint8_t*)data, len);
-    } else if (strcmp(fs, "XVFS") == 0) {
-        return xvfs_write_file(filename, (const uint8_t*)data, len);
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(filename, &rp) ||
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
+        return false;
     }
 
-    kprintf("[DEBUG] No mounted filesystem on drive %d\n", current_drive);
+    if (rp.fs == FS_FAT16) {
+        int written = fat16_write_file(rp.subpath, data, (int)len);
+        return written >= 0;
+    }
+    if (rp.fs == FS_FAT32) {
+        return fat32_write_file(rp.subpath, (const uint8_t*)data, len);
+    }
+    if (rp.fs == FS_XVFS) {
+        return xvfs_write_file(rp.subpath, (const uint8_t*)data, len);
+    }
     return false;
 }
 
-bool fscmd_exists(const char* path) {
-    if (current_fs == FS_FAT16)
-        return fat16_exists(path);
-    else if (current_fs == FS_FAT32)
-        return fat32_exists(path);
-    else if (current_fs == FS_XVFS)
-        return xvfs_exists(path);
-    else {
-        kprint("No filesystem mounted.\n");
+bool fscmd_write_file_at(const char* filename, uint32_t offset, const char* data, uint32_t len) {
+    if (!filename || *filename == '\0') {
         return false;
     }
+    if (!data && len > 0) {
+        return false;
+    }
+
+    uint32_t old_size = fscmd_get_file_size(filename);
+    if (offset > old_size) {
+        if (offset - old_size > 0xFFFFFFFFu - old_size) {
+            return false;
+        }
+    }
+    if (len > 0 && offset > 0xFFFFFFFFu - len) {
+        return false;
+    }
+
+    uint32_t end_pos = offset + len;
+    uint32_t new_size = old_size;
+    if (end_pos > new_size) {
+        new_size = end_pos;
+    }
+
+    uint8_t* merged = NULL;
+    if (new_size > 0) {
+        merged = (uint8_t*)kmalloc(new_size, 0, NULL);
+        if (!merged) {
+            return false;
+        }
+        memset(merged, 0, new_size);
+    }
+
+    if (old_size > 0) {
+        int read = fscmd_read_file_by_name(filename, merged, old_size);
+        if (read < 0 || (uint32_t)read != old_size) {
+            if (merged) {
+                kfree(merged);
+            }
+            return false;
+        }
+    }
+
+    if (len > 0) {
+        memcpy(merged + offset, data, len);
+    }
+    bool ok = fscmd_write_file(filename, (const char*)merged, new_size);
+    if (merged) {
+        kfree(merged);
+    }
+    return ok;
+}
+
+bool fscmd_append_file(const char* filename, const char* data, uint32_t len) {
+    if (!filename || *filename == '\0') {
+        return false;
+    }
+    if (!data && len > 0) {
+        return false;
+    }
+    if (len == 0) {
+        return true;
+    }
+
+    uint32_t old_size = fscmd_get_file_size(filename);
+    if (old_size > 0xFFFFFFFFu - len) {
+        return false;
+    }
+
+    return fscmd_write_file_at(filename, old_size, data, len);
+}
+
+bool fscmd_exists(const char* path) {
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(path, &rp)) {
+        return false;
+    }
+    if (rp.fs != FS_DEVFS &&
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
+        return false;
+    }
+
+    if (rp.fs == FS_DEVFS) return devfs_exists_subpath(rp.subpath);
+    if (rp.fs == FS_FAT16) return fat16_exists(rp.subpath);
+    if (rp.fs == FS_FAT32) return fat32_exists(rp.subpath);
+    if (rp.fs == FS_XVFS) return xvfs_exists(rp.subpath);
+    return false;
 }
 
 int fscmd_read_file_by_name(const char* path, uint8_t* buf, uint32_t size) {
-    if (current_fs == FS_FAT16)
-        return fat16_read_file_by_name(path, buf, size);
-    else if (current_fs == FS_FAT32)
-        return fat32_read_file_by_name(path, buf, size);
-    else if (current_fs == FS_XVFS)
-        return xvfs_read_file_by_name(path, buf, size);
-    else {
-        kprint("No filesystem mounted.\n");
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(path, &rp) ||
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
         return -1;
     }
+
+    if (rp.fs == FS_FAT16) return fat16_read_file_by_name(rp.subpath, buf, size);
+    if (rp.fs == FS_FAT32) return fat32_read_file_by_name(rp.subpath, buf, size);
+    if (rp.fs == FS_XVFS) return xvfs_read_file_by_name(rp.subpath, buf, size);
+    return -1;
 }
 
 // ─────────────────────────────
 // 파일 복사 (공통 명령어)
 // ─────────────────────────────
 bool fscmd_cp(const char* src, const char* dst) {
-    if (current_fs == FS_FAT16)
-        return fat16_cp(src, dst);
-    else if (current_fs == FS_FAT32)
-        return fat32_cp(src, dst);
-    else if (current_fs == FS_XVFS)
-        return xvfs_cp(src, dst);
-    else {
-        kprint("No filesystem mounted.\n");
+    fscmd_resolved_path_t s, d;
+    if (!fscmd_resolve_path(src, &s) || !fscmd_resolve_path(dst, &d)) {
         return false;
     }
+    if (s.fs != d.fs || s.drive != d.drive) {
+        kprint("cp: cross-mount copy not supported yet\n");
+        return false;
+    }
+    if (!fscmd_mount_backend(s.fs, s.drive, disks[s.drive].base_lba)) {
+        return false;
+    }
+    if (s.fs == FS_FAT16) return fat16_cp(s.subpath, d.subpath);
+    if (s.fs == FS_FAT32) return fat32_cp(s.subpath, d.subpath);
+    if (s.fs == FS_XVFS) return xvfs_cp(s.subpath, d.subpath);
+    return false;
 }
 
 // ─────────────────────────────
 // 파일 이동 (공통 명령어)
 // ─────────────────────────────
 bool fscmd_mv(const char* src, const char* dst) {
-    if (current_fs == FS_FAT16)
-        return fat16_mv(src, dst);
-    else if (current_fs == FS_FAT32)
-        return fat32_mv(src, dst);
-    else if (current_fs == FS_XVFS)
-        return xvfs_mv(src, dst);
-    else {
-        kprint("No filesystem mounted.\n");
+    fscmd_resolved_path_t s, d;
+    if (!fscmd_resolve_path(src, &s) || !fscmd_resolve_path(dst, &d)) {
         return false;
     }
+    if (s.fs != d.fs || s.drive != d.drive) {
+        kprint("mv: cross-mount move not supported yet\n");
+        return false;
+    }
+    if (!fscmd_mount_backend(s.fs, s.drive, disks[s.drive].base_lba)) {
+        return false;
+    }
+    if (s.fs == FS_FAT16) return fat16_mv(s.subpath, d.subpath);
+    if (s.fs == FS_FAT32) return fat32_mv(s.subpath, d.subpath);
+    if (s.fs == FS_XVFS) return xvfs_mv(s.subpath, d.subpath);
+    return false;
 }
 
 // ─────────────────────────────
 // 파일 크기 반환 (공통 명령어)
 // ─────────────────────────────
 uint32_t fscmd_get_file_size(const char* filename) {
-    if (current_fs == FS_FAT16)
-        return fat16_get_file_size(filename);
-    else if (current_fs == FS_FAT32)
-        return fat32_get_file_size(filename);
-    else if (current_fs == FS_XVFS)
-        return xvfs_get_file_size(filename);
-    else {
-        kprint("No filesystem mounted.\n");
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(filename, &rp) ||
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
         return 0;
     }
+
+    if (rp.fs == FS_FAT16) return fat16_get_file_size(rp.subpath);
+    if (rp.fs == FS_FAT32) return fat32_get_file_size(rp.subpath);
+    if (rp.fs == FS_XVFS) return xvfs_get_file_size(rp.subpath);
+    return 0;
 }
 
 // ─────────────────────────────
 // 파일 일부분 읽기 (공통 명령어)
 // ─────────────────────────────
 bool fscmd_read_file_partial(const char* filename, uint32_t offset, uint8_t* buf, uint32_t size) {
-    if (current_fs == FS_FAT16)
-        return fat16_read_file_partial(filename, offset, buf, size);
-    else if (current_fs == FS_FAT32)
-        return fat32_read_file_partial(filename, offset, buf, size);
-    else if (current_fs == FS_XVFS)
-        return xvfs_read_file_partial(filename, offset, buf, size);
-    else {
-        kprint("No filesystem mounted.\n");
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(filename, &rp) ||
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
         return false;
     }
+
+    if (rp.fs == FS_FAT16) return fat16_read_file_partial(rp.subpath, offset, buf, size);
+    if (rp.fs == FS_FAT32) return fat32_read_file_partial(rp.subpath, offset, buf, size);
+    if (rp.fs == FS_XVFS) return xvfs_read_file_partial(rp.subpath, offset, buf, size);
+    return false;
 }
 
 bool fscmd_mkdir(const char* dirname) {
-    if (current_fs == FS_FAT16) {
-        return fat16_mkdir(dirname);
-    }
-    else if (current_fs == FS_FAT32) {
-        return fat32_mkdir(dirname);
-    }
-    else if (current_fs == FS_XVFS) {
-        return xvfs_mkdir(dirname);
-    }
-    else {
-        kprint("No filesystem mounted.\n");
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(dirname, &rp) ||
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
         return false;
     }
+    if (rp.fs == FS_FAT16) return fat16_mkdir(rp.subpath);
+    if (rp.fs == FS_FAT32) return fat32_mkdir(rp.subpath);
+    if (rp.fs == FS_XVFS) return xvfs_mkdir(rp.subpath);
+    return false;
 }
 
 bool fscmd_cd(const char* path) {
-    if (current_fs == FS_FAT16) {
-        return fat16_cd(path);
-    }
-    else if (current_fs == FS_FAT32) {
-        return fat32_cd(path);
-    }
-    else if (current_fs == FS_XVFS) {
-        return xvfs_cd(path);
-    }
-    else {
-        kprint("No filesystem mounted.\n");
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(path, &rp)) {
         return false;
     }
+    if (rp.fs != FS_DEVFS &&
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
+        return false;
+    }
+
+    bool ok = false;
+    if (rp.subpath[0] == '\0' ||
+        (rp.subpath[0] == '/' && rp.subpath[1] == '\0')) {
+        ok = true;
+    } else if (rp.fs == FS_FAT16) {
+        ok = fat16_resolve_dir(rp.subpath) != 0xFFFF;
+    } else if (rp.fs == FS_FAT32) {
+        uint32_t cl = fat32_resolve_dir(rp.subpath);
+        ok = (cl >= 2 && cl < 0x0FFFFFF8);
+    } else if (rp.fs == FS_XVFS) {
+        ok = xvfs_is_dir(rp.subpath);
+    } else if (rp.fs == FS_DEVFS) {
+        ok = false;
+    }
+
+    if (!ok) {
+        return false;
+    }
+
+    strncpy(current_path, rp.abs_path, sizeof(current_path) - 1);
+    current_path[sizeof(current_path) - 1] = '\0';
+    return true;
 }
 
 bool fscmd_rmdir(const char* dirname) {
-    if (current_fs == FS_FAT16) {
-        return fat16_rmdir(dirname);
-    }
-    else if (current_fs == FS_FAT32) {
-        return fat32_rmdir(dirname);
-    }
-    else if (current_fs == FS_XVFS) {
-        return xvfs_rmdir(dirname);
-    }
-    else {
-        kprint("No filesystem mounted.\n");
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(dirname, &rp) ||
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
         return false;
     }
+    if (rp.fs == FS_FAT16) return fat16_rmdir(rp.subpath);
+    if (rp.fs == FS_FAT32) return fat32_rmdir(rp.subpath);
+    if (rp.fs == FS_XVFS) return xvfs_rmdir(rp.subpath);
+    return false;
 }
 
 bool fscmd_find_file(const char* path, void* out_entry) {
-    if (current_fs == FS_FAT16) {
-        return fat16_find_file(path, (FAT16_DirEntry*)out_entry);
-    }
-    else if (current_fs == FS_FAT32) {
-        return fat32_find_file(path, (FAT32_DirEntry*)out_entry);
-    }
-    else if (current_fs == FS_XVFS) {
-        return xvfs_find_file(path, (XVFS_FileEntry*)out_entry);
-    }
-    else {
-        kprint("No filesystem mounted.\n");
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(path, &rp) ||
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
         return false;
     }
+    if (rp.fs == FS_FAT16) return fat16_find_file(rp.subpath, (FAT16_DirEntry*)out_entry);
+    if (rp.fs == FS_FAT32) return fat32_find_file(rp.subpath, (FAT32_DirEntry*)out_entry);
+    if (rp.fs == FS_XVFS) return xvfs_find_file(rp.subpath, (XVFS_FileEntry*)out_entry);
+    return false;
 }
 
 bool fscmd_read_file_range(void* entry, uint32_t offset, uint8_t* out_buf, uint32_t size) {
@@ -498,7 +1121,7 @@ bool fscmd_format(uint8_t drive, const char* fs) {
     }
 
     // 디스크 존재 확인
-    uint32_t total = ata_get_sector_count(drive);
+    uint32_t total = blockdev_get_sector_count(drive);
     if (total == 0) {
         kprintf("[format] drive %d not detected.\n", drive);
         return false;
@@ -510,7 +1133,7 @@ bool fscmd_format(uint8_t drive, const char* fs) {
 
     if (base_lba > 0) {
         uint8_t mbr[512];
-        if (ata_read(drive, 0, 1, mbr) && mbr[510] == 0x55 && mbr[511] == 0xAA) {
+        if (blockdev_read(drive, 0, 1, mbr) && mbr[510] == 0x55 && mbr[511] == 0xAA) {
             MBRPart* p = (MBRPart*)(mbr + 0x1BE);
             for (int i = 0; i < 4; i++) {
                 if (p[i].type == 0) continue;
@@ -608,7 +1231,7 @@ bool fscmd_format(uint8_t drive, const char* fs) {
 update_mbr_type:
     if (part_index >= 0) {
         uint8_t mbr[512];
-        if (ata_read(drive, 0, 1, mbr) && mbr[510] == 0x55 && mbr[511] == 0xAA) {
+        if (blockdev_read(drive, 0, 1, mbr) && mbr[510] == 0x55 && mbr[511] == 0xAA) {
             MBRPart* p = (MBRPart*)(mbr + 0x1BE);
             if (strcmp(type, "fat16") == 0)
                 p[part_index].type = 0x06;
@@ -616,36 +1239,38 @@ update_mbr_type:
                 p[part_index].type = 0x0C;
             else if (strcmp(type, "xvfs") == 0)
                 p[part_index].type = 0x83;
-            ata_write(drive, 0, 1, mbr);
+            blockdev_write(drive, 0, 1, mbr);
         }
     }
     return true;
 }
 
 int fscmd_read_file(const char* filename, uint8_t* buffer, uint32_t offset, uint32_t size) {
-    if (current_fs == FS_FAT16) {
+    fscmd_resolved_path_t rp;
+    if (!fscmd_resolve_path(filename, &rp) ||
+        !fscmd_mount_backend(rp.fs, rp.drive, disks[rp.drive].base_lba)) {
+        return -1;
+    }
+
+    if (rp.fs == FS_FAT16) {
         FAT16_DirEntry entry;
-        if (!fat16_find_file(filename, &entry))
+        if (!fat16_find_file(rp.subpath, &entry))
             return -1;
 
         return fat16_read_file(&entry, buffer, offset, size);
     }
 
-    else if (current_fs == FS_FAT32) {
-        return fat32_read_file(filename, buffer, offset, size);
+    else if (rp.fs == FS_FAT32) {
+        return fat32_read_file(rp.subpath, buffer, offset, size);
     }
 
-    else if (
-        current_fs == FS_XVFS) {
+    else if (rp.fs == FS_XVFS) {
         XVFS_FileEntry entry;
-        if (!xvfs_find_file(filename, &entry))
+        if (!xvfs_find_file(rp.subpath, &entry))
             return -1;
 
         return xvfs_read_file(&entry, buffer, offset, size);
     }
 
-    else {
-        kprint("No filesystem mounted.\n");
-        return -1;
-    }
+    return -1;
 }
