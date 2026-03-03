@@ -281,8 +281,6 @@ orion.img: init/init.elf kernel.elf test.bin $(APP_BIN) $(CMDS_APP_BINS) $(LIMIN
 	mcopy -i $@@@$$OFFSET orion.stg ::/system/config/orion.stg; \
 	mcopy -i $@@@$$OFFSET test/motd.txt ::/system/config/motd.txt; \
 	mcopy -i $@@@$$OFFSET $(APP_BIN) ::/home/app; \
-	mcopy -i $@@@$$OFFSET test/123.wav ::/a.wav
-
 		@echo "[+] Install Limine to MBR..."
 		@./boot/limine bios-install $@
 
