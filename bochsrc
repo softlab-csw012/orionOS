@@ -1,0 +1,31 @@
+# ===== 메모리 =====
+megs: 128
+memory: guest=128, host=128
+
+# ===== BIOS =====
+romimage: file=/usr/share/bochs/BIOS-bochs-latest
+vgaromimage: file=/usr/share/bochs/VGABIOS-lgpl-latest.bin
+boot: disk
+
+# ===== CPU (느리고 현실적으로) =====
+cpu: count=1, ips=20000000, reset_on_triple_fault=0
+
+# ===== 디스크 =====
+ata0: enabled=1, ioaddr1=0x1f0, ioaddr2=0x3f6, irq=14
+ata0-master: type=disk, path="orion.img", mode=flat
+
+# ===== 인터럽트/타이머 현실화 =====
+clock: sync=none, time0=local
+keyboard: type=mf
+mouse: enabled=1
+
+# ===== 로그 =====
+log: bochslog.txt
+panic: action=ask
+error: action=report
+info: action=report
+debug: action=report
+
+# ===== 예외 추적 =====
+magic_break: enabled=1
+display_library: x

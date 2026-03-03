@@ -13,13 +13,26 @@ typedef enum {
     FS_XVFS
 } fs_type_t;
 
+typedef struct {
+    fs_type_t fs;
+    int drive;
+    char target[32];
+} fscmd_mount_info_t;
+
 // 현재 마운트된 드라이브와 FS 상태
 extern fs_type_t current_fs;
 extern int current_drive;
 extern char current_path[256];
 
+#define FSCMD_MODE_OWNER_R  0x01u
+#define FSCMD_MODE_OWNER_W  0x02u
+#define FSCMD_MODE_OWNER_RW (FSCMD_MODE_OWNER_R | FSCMD_MODE_OWNER_W)
+
 // 명령어 (공통 인터페이스)
 const char* fs_to_string(fs_type_t type);
+void fscmd_set_fat_mount_policy(uint32_t owner_uid, uint32_t owner_gid, uint8_t mode);
+void fscmd_get_fat_mount_policy(uint32_t* out_owner_uid, uint32_t* out_owner_gid, uint8_t* out_mode);
+bool fscmd_get_path_meta(const char* path, uint32_t* out_owner_uid, uint32_t* out_owner_gid, uint8_t* out_mode);
 void fscmd_reset_path(void);
 void fscmd_ls(const char* path);
 int fscmd_list_dir(const char* path, char* names, uint8_t* is_dir, uint32_t max_entries, size_t name_len);
@@ -37,10 +50,18 @@ bool fscmd_cd(const char* path);
 bool fscmd_rmdir(const char* dirname);
 bool fscmd_find_file(const char* path, void* out_entry);
 bool fscmd_write_file(const char* filename, const char* data, uint32_t len);
+bool fscmd_write_file_at(const char* filename, uint32_t offset, const char* data, uint32_t len);
+bool fscmd_append_file(const char* filename, const char* data, uint32_t len);
 void fscmd_write_progress_begin(const char* label, uint32_t total);
 void fscmd_write_progress_update(uint32_t written);
 void fscmd_write_progress_finish(bool success);
 bool fscmd_read_file_range(void* entry, uint32_t offset, uint8_t* out_buf, uint32_t size);
 bool fscmd_format(uint8_t drive, const char* fs);
+void fscmd_set_single_root_mode(bool enabled);
+bool fscmd_get_single_root_mode(void);
+bool fscmd_mount_drive_at(int drive, const char* target);
+bool fscmd_unmount(const char* target);
+void fscmd_clear_mounts(void);
+int fscmd_list_mounts(fscmd_mount_info_t* out, int max_entries);
 
 #endif

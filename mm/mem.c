@@ -2,7 +2,7 @@
 #include "paging.h"
 #include <stdint.h>
 #include <stddef.h>
-#include "../drivers/screen.h"
+#include "../kernel/io/console.h"
 
 #define ALIGN4(x)         (((x) + 3u) & ~3u)
 #define ALIGN_UP(x, a)    (((x) + ((a) - 1u)) & ~((a) - 1u))

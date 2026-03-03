@@ -160,9 +160,9 @@ void sysmgr_thread(void) {
         }
         if (sysmgr_user_shell_pending) {
             sysmgr_user_shell_pending = false;
-            const char* path = "/cmd/shell.sys";
+            const char* path = "/cmd/shell";
             const char* argv[] = { path };
-            sysmgr_launch_process(path, argv, 1, false, "sh: failed to start /cmd/shell.sys\n");
+            sysmgr_launch_process(path, argv, 1, false, "sh: failed to start /cmd/shell\n");
             had_output = true;
         }
         timer_task_run_due();

@@ -14,6 +14,11 @@
 #define NOTE_KEY_RIGHT  0x91
 #define NOTE_KEY_UP     0x92
 #define NOTE_KEY_DOWN   0x93
+#define NOTE_KEY_PGUP   0x94
+#define NOTE_KEY_PGDN   0x95
+#define NOTE_KEY_HOME   0x96
+#define NOTE_KEY_END    0x97
+#define NOTE_KEY_DEL    0x98
 
 extern bool keyboard_input_enabled;
 extern bool alt_pressed;

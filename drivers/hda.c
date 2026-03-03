@@ -1,7 +1,7 @@
 #include "hda.h"
 #include "pci.h"
 #include "hal.h"
-#include "../drivers/screen.h"
+#include "../kernel/io/console.h"
 #include "../libc/string.h"
 #include "../mm/mem.h"
 #include "../mm/paging.h"

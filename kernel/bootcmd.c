@@ -3,7 +3,8 @@
 #include "bootcmd.h"
 #include "kernel.h"
 #include "ramdisk.h"
-#include "../drivers/screen.h"  // kprint 등
+#include "../kernel/io/console.h"
+#include "../drivers/screen.h"
 #include "../drivers/keyboard.h"
 #include "../fs/fscmd.h"
 #include "../libc/string.h"
@@ -11,6 +12,8 @@
 #include "../mm/paging.h"
 #include "multiboot.h"
 #include "cmd.h"
+#include "devfs.h"
+#include "../drivers/ramdisk.h"
 
 char* boot_cmdline = NULL;
 extern int current_drive;
@@ -23,6 +26,18 @@ uint32_t ramdisk_mod_end = 0;
 char ramdisk_mod_cmdline[64];
 extern bool ramdisk_auto_mount;
 int rootdisk = -1; // -1 = auto, 0~ = specific disk number
+static const char* k_initramfs_default_path = "/boot/ramdisk.img";
+
+static void bootcmd_activate_ramdisk_root_if_any(void) {
+    int rd = ramdisk_drive_id();
+    if (rd < 0) {
+        return;
+    }
+
+    devfs_refresh_block_nodes();
+    kprintf("[bootcmd] initramfs root -> %d#\n", rd);
+    m_disk_num(rd);
+}
 
 static void try_load_default_font(bool force) {
     const char* path = "/system/font/orion.fnt";
@@ -47,14 +62,17 @@ static bool map_framebuffer_range(uint64_t addr, uint64_t size) {
     uint32_t start = (uint32_t)(addr & 0xFFFFF000u);
     uint32_t end_aligned = (uint32_t)((end + 0xFFFu) & 0xFFFFF000u);
 
-    uint32_t flags = PAGE_PRESENT | PAGE_RW;
-    if (paging_pat_wc_enabled())
-        flags |= PAGE_PAT;
-    else
-        flags |= PAGE_PCD;
+    uint32_t flags = PAGE_PRESENT | PAGE_RW | paging_wc_cache_flags();
 
     for (uint32_t p = start; p < end_aligned; p += PAGE_SIZE)
         vmm_map_page(p, p, flags);
+
+    kprintf("[MB2] FB cache flags: %s (PAT=%u PCD=%u PWT=%u)\n",
+            paging_pat_wc_enabled() ? "WC(PAT)" : "UC(fallback)",
+            (flags & PAGE_PAT) ? 1u : 0u,
+            (flags & PAGE_PCD) ? 1u : 0u,
+            (flags & PAGE_PWT) ? 1u : 0u);
+    dump_mapping(start);
 
     return true;
 }
@@ -249,24 +267,36 @@ void parse_bootcmd() {
             if (current_fs == FS_NONE) {
                 ramdisk_auto_mount = true;
                 kprint("[kernel] Since the disk type is unknown, it is mounted as a ramdisk.\n");  
-                m_disk("7");
+            }
+
+            if (ramdisk_mod_present) {
+                (void)ramdisk_load_from_module(ramdisk_mod_start, ramdisk_mod_end, ramdisk_mod_cmdline);
             }
 
             if (ramdisk_enable) {
-                ramdisk_load_from_path(ramdisk_path);
+                (void)ramdisk_load_from_path(ramdisk_path);
+            } else if (current_fs != FS_NONE && fscmd_exists(k_initramfs_default_path)) {
+                (void)ramdisk_load_from_path(k_initramfs_default_path);
             }
+            bootcmd_activate_ramdisk_root_if_any();
         } else {
             ramdisk_auto_mount = true;
             kprint("[kernel] no top drive specified\n");
             kprint("[kernel] Automatic disk mount failed, so mounting as ramdisk.\n");
-            m_disk("7");
+            if (ramdisk_mod_present) {
+                (void)ramdisk_load_from_module(ramdisk_mod_start, ramdisk_mod_end, ramdisk_mod_cmdline);
+            }
+            bootcmd_activate_ramdisk_root_if_any();
         }
 
     } else {
         ramdisk_auto_mount = true; 
         kprint("[kernel] no bootcmd\n");
         kprint("[kernel] No disk selected, mounting as ramdisk.\n");
-        m_disk("7");
+        if (ramdisk_mod_present) {
+            (void)ramdisk_load_from_module(ramdisk_mod_start, ramdisk_mod_end, ramdisk_mod_cmdline);
+        }
+        bootcmd_activate_ramdisk_root_if_any();
     }
 
     kprint("[kernel] enabling custom font from bootcmd...\n");

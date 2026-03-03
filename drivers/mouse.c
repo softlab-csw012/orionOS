@@ -4,6 +4,7 @@
 #include "../cpu/isr.h"
 #include "../drivers/screen.h"
 #include "../drivers/keyboard.h"
+#include "../drivers/hal.h"
 #include <stddef.h>
 
 #define inb(port) hal_in8(port)
@@ -43,6 +44,13 @@ static uint32_t fb_cursor_backup[CURSOR_SAVE_W * CURSOR_SAVE_H];
 static float acc_x = 0.0f;
 static float acc_y = 0.0f;
 static const float sensitivity = 0.35f;
+
+static int mouse_packet_size = 3;
+
+static void ps2_flush() {
+    while (inb(0x64) & 1)
+        inb(0x60);
+}
 
 static bool fb_cursor_info(int* out_w, int* out_h, int* out_fw, int* out_fh) {
     screen_fb_info_t info;
@@ -186,8 +194,15 @@ static void mouse_apply_movement(int dx, int dy, int wheel) {
     mouse.x += move_x;
     mouse.y += move_y;
 
-    int max_x = screen_get_cols() - 1;
-    int max_y = screen_get_rows() - 1;
+    int max_x = 0;
+    int max_y = 0;
+    if (fb_ready) {
+        max_x = fb_w - 1;
+        max_y = fb_h - 1;
+    } else {
+        max_x = screen_get_cols() - 1;
+        max_y = screen_get_rows() - 1;
+    }
     if (max_x < 0) max_x = 0;
     if (max_y < 0) max_y = 0;
 
@@ -197,8 +212,8 @@ static void mouse_apply_movement(int dx, int dy, int wheel) {
 
     if (mouse_draw_enabled) {
         if (fb_ready) {
-            int px = mouse.x * fb_fw;
-            int py = mouse.y * fb_fh;
+            int px = mouse.x;
+            int py = mouse.y;
             int old_px = fb_cursor_px;
             int old_py = fb_cursor_py;
             bool old_active = fb_cursor_active;
@@ -255,28 +270,32 @@ void mouse_handler(registers_t* regs) {
 
     uint8_t status = inb(0x64);
 
-    if (!(status & 0x01)) return;
+    if (!(status & 1)) return;
     if (!(status & 0x20)) return;
 
     int8_t data = inb(0x60);
     if (ignore_ps2_mouse) return;
 
-    if (mouse_cycle == 0 && !(data & 0x08)) {
-        mouse_cycle = 0;
+    /* 패킷 시작 바이트 검증 */
+    if (mouse_cycle == 0 && !(data & 0x08))
         return;
-    }
 
     mouse_bytes[mouse_cycle++] = data;
 
-    if (mouse_cycle < 4)
+    if (mouse_cycle < mouse_packet_size)
         return;
 
     mouse_cycle = 0;
 
     int dx = mouse_bytes[1];
     int dy = -mouse_bytes[2];
-    int wheel = (int8_t)mouse_bytes[3];
+
+    int wheel = 0;
+    if (mouse_packet_size == 4)
+        wheel = (int8_t)mouse_bytes[3];
+
     mouse.buttons = mouse_bytes[0] & 0x07;
+
     mouse_apply_movement(dx, dy, wheel);
 }
 
@@ -301,8 +320,8 @@ void mouse_set_draw(bool enable) {
         }
     } else {
         if (fb_ready) {
-            int px = mouse.x * fb_fw;
-            int py = mouse.y * fb_fh;
+            int px = mouse.x;
+            int py = mouse.y;
             fb_cursor_draw(fb_w, fb_h, px, py, NULL);
         } else {
             last_char = screen_get_at(mouse.x, mouse.y);
@@ -338,20 +357,29 @@ void mouse_write(uint8_t data) {
     outb(0x60, data);
 }
 
-static uint8_t mouse_read_ack() {
+static uint8_t mouse_read() {
     mouse_wait(0);
     return inb(0x60);
 }
 
-
+static void mouse_expect_ack() {
+    uint8_t r = mouse_read();
+    if (r != 0xFA) {
+        kprintf("[PS/2] mouse ack error: %x\n", r);
+    }
+}
 
 /* ===========================================
  *                INIT FUNCTION
  * =========================================== */
 void mouse_init() {
+
+    cli();                      // 🔴 init 중 인터럽트 차단
+    ps2_flush();                // 🔴 남아있는 쓰레기 데이터 제거
+
     register_interrupt_handler(IRQ12, mouse_handler);
 
-    /* Enable auxiliary device (mouse) */
+    /* Enable auxiliary device */
     mouse_wait(1);
     outb(0x64, 0xA8);
 
@@ -360,30 +388,39 @@ void mouse_init() {
     outb(0x64, 0x20);
     mouse_wait(0);
     uint8_t status = inb(0x60);
-    status |= 2; // enable IRQ12
+    status |= 2;
     mouse_wait(1);
     outb(0x64, 0x60);
     mouse_wait(1);
     outb(0x60, status);
 
-    /* Default settings */
+    ps2_flush();
+
+    /* Reset defaults */
     mouse_write(0xF6);
-    mouse_read_ack();
+    mouse_expect_ack();
 
-    /* Enable */
+    /* Enable streaming */
     mouse_write(0xF4);
-    mouse_read_ack();
+    mouse_expect_ack();
 
-    /* Scroll wheel enable (IntelliMouse) */
-    mouse_write(0xF3); mouse_write(200);
-    mouse_write(0xF3); mouse_write(100);
-    mouse_write(0xF3); mouse_write(80);
+    /* IntelliMouse negotiation */
+    mouse_write(0xF3); mouse_expect_ack(); mouse_write(200); mouse_expect_ack();
+    mouse_write(0xF3); mouse_expect_ack(); mouse_write(100); mouse_expect_ack();
+    mouse_write(0xF3); mouse_expect_ack(); mouse_write(80);  mouse_expect_ack();
 
-    /* Get ID */
+    /* Get device ID */
     mouse_write(0xF2);
-    mouse_wait(0);
-    uint8_t id = inb(0x60);
+    mouse_expect_ack();
+    uint8_t id = mouse_read();
 
-    kprintf("[PS/2] Mouse ID=%d\n", id);
-    kprintf("[PS/2] Mouse initialized!\n");
+    if (id == 3) mouse_packet_size = 4;
+    else mouse_packet_size = 3;
+
+    kprintf("[PS/2] Mouse ID=%d packet=%d\n", id, mouse_packet_size);
+
+    ps2_flush();
+
+    sti();                      // 🔴 이제 인터럽트 허용
+    kprintf("[PS/2] Mouse initialized safely\n");
 }

@@ -1,6 +1,12 @@
 #pragma once
 #include <stdint.h>
 
+// Segment selectors (must match gdt_install layout in gdt.c)
+#define KERNEL_CS 0x08
+#define KERNEL_DS 0x10
+#define USER_CS   0x1B
+#define USER_DS   0x23
+
 // GDT 엔트리 구조체 (Packed)
 struct gdt_entry {
     uint16_t limit_low;     // 세그먼트 한계 (하위 16비트)

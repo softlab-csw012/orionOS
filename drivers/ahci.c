@@ -1,6 +1,6 @@
 #include "ahci.h"
 #include "hal.h"
-#include "screen.h"
+#include "../kernel/io/console.h"
 #include "../mm/paging.h"
 #include "../mm/mem.h"
 #include "../libc/string.h"

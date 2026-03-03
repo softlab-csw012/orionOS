@@ -1,7 +1,7 @@
 #include "isr.h"
 #include "idt.h"
 #include "../kernel/syscall.h"
-#include "../drivers/screen.h"
+#include "../kernel/io/console.h"
 #include "../drivers/keyboard.h"
 #include "../libc/string.h"
 #include "timer.h"
@@ -12,6 +12,7 @@
 
 isr_t interrupt_handlers[256];
 extern void isr_syscall();
+static volatile uint8_t g_irq_ready = 0;
 
 #define RECURSIVE_PT_BASE 0xFFC00000u
 #define RECURSIVE_PD_BASE 0xFFFFF000u
@@ -62,8 +63,9 @@ void isr_install() {
     port_byte_out(0xA1, 0x02);
     port_byte_out(0x21, 0x01);
     port_byte_out(0xA1, 0x01);
-    port_byte_out(0x21, 0x0);
-    port_byte_out(0xA1, 0x0); 
+    /* Keep all IRQ lines masked until the kernel announces it's ready. */
+    port_byte_out(0x21, 0xFF);
+    port_byte_out(0xA1, 0xFF);
 
     // Install the IRQs
     set_idt_gate(32, (uint32_t)irq0);
@@ -177,7 +179,6 @@ static bool handle_user_exception(registers_t *r) {
     process_t* p = proc_current();
     uint32_t pid = p ? p->pid : 0;
     const char* name = p ? p->name : "unknown";
-    bool foreground = proc_is_foreground_pid(pid);
     if (r->int_no == 13) {
         const char* priv = user_privileged_opcode_name(r->eip);
         if (priv) {
@@ -223,12 +224,6 @@ static bool handle_user_exception(registers_t *r) {
     }
 
     proc_exit(r->int_no);
-    if (foreground) {
-        r->eip = (uint32_t)bin_exit_trampoline;
-        r->cs = KERNEL_CS;
-        r->ds = KERNEL_DS;
-        return true;
-    }
     if (!proc_schedule(r, false)) {
         r->eip = (uint32_t)bin_exit_trampoline;
         r->cs = KERNEL_CS;
@@ -342,14 +337,18 @@ void register_interrupt_handler(uint8_t n, isr_t handler) {
 }
 
 void irq_dispatch(registers_t *r) {
-    /* After every interrupt we need to send an EOI to the PICs
-     * or they will not send another interrupt again */
-    if (r->int_no >= 40) port_byte_out(0xA0, 0x20); /* slave */
-    port_byte_out(0x20, 0x20); /* master */
+    if (!g_irq_ready) {
+        goto send_eoi;
+    }
 
-    /* Handle the interrupt in a more modular way */
     (void)dispatch_registered_handler(r);
     (void)proc_handle_kill(r);
+    (void)proc_handle_signals(r);
+
+send_eoi:
+    if (r->int_no >= 40)
+        port_byte_out(0xA0, 0x20);
+    port_byte_out(0x20, 0x20);
 }
 
 void isr_handler(registers_t *r) {
@@ -368,7 +367,22 @@ void irq_install() {
 
     /* IRQ1: keyboard */
     init_keyboard();
+}
 
-    /* 마지막에 인터럽트 활성화 */
+void irq_set_ready(uint8_t ready) {
+    g_irq_ready = ready ? 1u : 0u;
+}
+
+uint8_t irq_is_ready(void) {
+    return g_irq_ready;
+}
+
+void irq_enable(void) {
+    if (!g_irq_ready) {
+        return;
+    }
+    /* Unmask PIC IRQ lines only after boot-critical init is complete. */
+    port_byte_out(0x21, 0x00);
+    port_byte_out(0xA1, 0x00);
     asm volatile("sti");
 }

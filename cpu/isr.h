@@ -72,25 +72,26 @@ extern void irq15();
 #define IRQ14 46
 #define IRQ15 47
 
-/* Struct which aggregates many registers.
- * It matches exactly the pushes on interrupt.asm. From the bottom:
- * - Pushed by the processor automatically
- * - `push byte`s on the isr-specific code: error code, then int number
- * - All the registers by pusha
- * - `push eax` whose lower 16-bits contain DS
+/* Must match interrupt.asm stack layout exactly (lowest address first):
+ * ds, pusha(edi..eax), int_no, err_code, eip, cs, eflags, esp, ss
  */
-typedef struct {
-   uint16_t ds; /* Data segment selector */
-   uint32_t edi, esi, ebp, useless, ebx, edx, ecx, eax; /* Pushed by pusha. */
-   uint32_t int_no, err_code; /* Interrupt number and error code (if applicable) */
-   uint32_t eip, cs, eflags, esp, ss; /* Pushed by the processor automatically */
+typedef struct __attribute__((packed)) {
+   uint32_t ds;
+   uint32_t edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax;
+   uint32_t int_no, err_code;
+   uint32_t eip, cs, eflags, esp, ss;
 } registers_t;
+
+typedef char registers_t_size_must_be_64[(sizeof(registers_t) == 64) ? 1 : -1];
 
 void isr_install();
 void isr_handler(registers_t *r);
 void isr_dispatch(registers_t *r);
 void irq_install();
 void irq_dispatch(registers_t *r);
+void irq_set_ready(uint8_t ready);
+uint8_t irq_is_ready(void);
+void irq_enable(void);
 
 typedef void (*isr_t)(registers_t*);
 void register_interrupt_handler(uint8_t n, isr_t handler);

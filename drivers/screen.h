@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "../kernel/io/console.h"
 
 #define VIDEO_ADDRESS 0xB8000
 #define MAX_SCROLL_LINES 500
@@ -41,16 +42,8 @@ extern int input_start_offset;
 /* Public kernel API */
 void clear_screen(void);
 void clear_input_line(void);
-void kprint_at(const char *message, int col, int row);
-void kprint(const char *message);
-void kprint_float(double value);
 void kprint_backspace();
-void print_hex(uint32_t num);
-int int_to_str(int value, char *buf);
-void kprint_int(uint32_t num);
-int putchar(int c);
 uint8_t vga_attr(uint8_t fg, uint8_t bg);
-void kprint_color(const char* message, uint8_t fg, uint8_t bg);
 int print_char(char c, int col, int row, char attr);
 void screen_put_at(int x, int y, uint8_t ch, uint8_t color);
 uint16_t screen_get_at(int x, int y);
@@ -62,18 +55,11 @@ void set_color(uint8_t fg, uint8_t bg);
 void update_prompt_position();
 int get_offset(int col, int row);
 void set_cursor_offset(int offset);
-void kprint_char(char c);
-void kprintf(const char* fmt, ...);
 void vga_putc(int x, int y, char ch, uint8_t attr);
 void scroll_up_screen(void);
 void scroll_down_screen(void);
 bool screen_is_scrolled(void);
 void screen_scroll_to_bottom(void);
-void print_hex_pad(uint32_t val, int width);
-void print_byte(uint8_t val);
-void print_dec(uint32_t num);
-void print_offset(uint32_t val);
-int putchar_color(uint8_t ch, uint8_t fg, uint8_t bg);
 void screen_set_framebuffer(uint64_t addr, uint32_t width, uint32_t height, uint32_t pitch, uint8_t bpp);
 bool screen_is_framebuffer(void);
 int screen_get_cols(void);
@@ -81,6 +67,7 @@ int screen_get_rows(void);
 void screen_set_cursor_visible(bool visible);
 void screen_set_cursor_blink(bool enabled);
 void screen_cursor_blink_tick(void);
+int screen_write(const char* buf, size_t len);
 
 typedef struct {
     uint32_t width;
@@ -95,6 +82,9 @@ typedef struct {
 bool screen_get_framebuffer_info(screen_fb_info_t* out);
 void screen_fb_fill_rect(int x, int y, int w, int h, uint32_t color);
 void screen_fb_draw_text(int x, int y, const char* text, uint32_t fg, uint32_t bg, bool transparent);
+void screen_fb_blit(int x, int y, int w, int h, const uint32_t* src, uint32_t src_pitch_bytes);
+void screen_buf_draw_text(uint32_t* dst, int dst_w, int dst_h, uint32_t dst_pitch_bytes,
+                          int x, int y, const char* text, uint32_t fg, uint32_t bg, bool transparent);
 bool screen_fb_get_pixel(int x, int y, uint32_t* out);
 void screen_fb_set_pixel(int x, int y, uint32_t color);
 

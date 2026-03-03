@@ -1,14 +1,16 @@
 #include "paging.h"
 #include "pmm.h"
-#include "mem.h"
-#include "../drivers/screen.h"
+#include "../kernel/io/console.h"
 #include "../libc/string.h"
 #include <stddef.h>
 #include <stdbool.h>
 
 #define PAGE_SIZE     4096
+#define KERNEL_VIRT_BASE 0xC0000000u
 #define RECURSIVE_PT_BASE 0xFFC00000u
 #define RECURSIVE_PD_BASE 0xFFFFF000u
+#define PAGING_STRUCT_VIRT_BASE  0xFF000000u
+#define PAGING_STRUCT_VIRT_LIMIT 0xFFC00000u
 #define MSR_IA32_PAT 0x277u
 #define PAT_TYPE_WC 0x01u
 
@@ -95,6 +97,7 @@ static uint32_t* current_page_directory = page_directory;
 static uint32_t current_page_directory_phys = 0;
 static uint32_t* kernel_page_directory = page_directory;
 static uint32_t kernel_page_directory_phys = 0;
+static uint32_t paging_struct_virt_next = PAGING_STRUCT_VIRT_BASE;
 
 static void load_pd(uint32_t* pd){
     asm volatile("mov %0, %%cr3"::"r"(pd));
@@ -107,36 +110,88 @@ static void enable_pg(){
     );
 }
 
+static uint32_t* paging_map_struct_page(uint32_t phys) {
+    if (!phys) {
+        return NULL;
+    }
+    if (paging_struct_virt_next >= PAGING_STRUCT_VIRT_LIMIT) {
+        kprint("[VMM] paging struct VA window exhausted\n");
+        return NULL;
+    }
+
+    uint32_t virt = paging_struct_virt_next;
+    paging_struct_virt_next += PAGE_SIZE;
+
+    map_page(kernel_page_directory, virt, phys, PAGE_PRESENT | PAGE_RW);
+    if (paging_is_enabled()) {
+        invlpg(virt);
+    }
+
+    return (uint32_t*)virt;
+}
+
+static inline void paging_sync_kernel_pdes(uint32_t* dir) {
+    if (!dir || dir == kernel_page_directory) {
+        return;
+    }
+    /* Share kernel upper-1GB mappings (except recursive slot 1023). */
+    memcpy(&dir[768], &kernel_page_directory[768], (1023 - 768) * sizeof(uint32_t));
+}
+
 void map_page(uint32_t* dir, uint32_t virt, uint32_t phys, uint32_t flags) {
+    const bool kernel_virt = (virt >= KERNEL_VIRT_BASE);
+    uint32_t* target_dir = dir;
+    if (kernel_virt) {
+        target_dir = kernel_page_directory;
+    }
+    if (!target_dir) {
+        return;
+    }
+
     uint32_t dir_idx   = virt >> 22;
     uint32_t table_idx = (virt >> 12) & 0x3FF;
 
     // 이미 PDE가 있으면 그대로 사용
-    if (!(dir[dir_idx] & PAGE_PRESENT)) {
+    if (!(target_dir[dir_idx] & PAGE_PRESENT)) {
         uint32_t new_table_phys = (uint32_t)pmm_alloc_page();
         if (!new_table_phys) {
             kprint("[VMM] Out of memory allocating page table\n");
             return;
         }
-        dir[dir_idx] = (new_table_phys & 0xFFFFF000u) | PAGE_PRESENT | PAGE_RW;
+        target_dir[dir_idx] = (new_table_phys & 0xFFFFF000u) | PAGE_PRESENT | PAGE_RW;
         if (flags & PAGE_USER)
-            dir[dir_idx] |= PAGE_USER;
+            target_dir[dir_idx] |= PAGE_USER;
 
         if (paging_is_enabled()) {
+            if (current_page_directory != target_dir) {
+                current_page_directory[dir_idx] = target_dir[dir_idx];
+            }
             uint32_t* table = (uint32_t*)(RECURSIVE_PT_BASE + dir_idx * PAGE_SIZE);
             memset(table, 0, PAGE_SIZE);
         } else {
             memset((void*)new_table_phys, 0, PAGE_SIZE);
         }
     } else if (flags & PAGE_USER) {
-        dir[dir_idx] |= PAGE_USER;
+        target_dir[dir_idx] |= PAGE_USER;
+    }
+
+    if (kernel_virt) {
+        if (dir && dir != kernel_page_directory) {
+            dir[dir_idx] = target_dir[dir_idx];
+        }
+        if (current_page_directory && current_page_directory != kernel_page_directory) {
+            current_page_directory[dir_idx] = target_dir[dir_idx];
+        }
     }
 
     uint32_t* table;
     if (paging_is_enabled()) {
+        if (current_page_directory != target_dir) {
+            current_page_directory[dir_idx] = target_dir[dir_idx];
+        }
         table = (uint32_t*)(RECURSIVE_PT_BASE + dir_idx * PAGE_SIZE);
     } else {
-        table = (uint32_t*)(dir[dir_idx] & 0xFFFFF000u);
+        table = (uint32_t*)(target_dir[dir_idx] & 0xFFFFF000u);
     }
     table[table_idx] = (phys & 0xFFFFF000) | flags;
 }
@@ -213,6 +268,15 @@ bool paging_pat_wc_enabled(void) {
     return g_pat_wc_enabled;
 }
 
+uint32_t paging_wc_cache_flags(void) {
+    if (g_pat_wc_enabled) {
+        /* PAT index 4: PAT=1, PCD=0, PWT=0 => WC (configured in IA32_PAT[4]). */
+        return PAGE_PAT;
+    }
+    /* Fallback for CPUs without PAT support: uncached. */
+    return PAGE_PCD;
+}
+
 int vmm_map_page(uint32_t virt, uint32_t phys, uint32_t flags) {
     map_page(current_page_directory, virt, phys, flags);
     if (paging_is_enabled())
@@ -270,6 +334,45 @@ int vmm_virt_to_phys(uint32_t virt, uint32_t* out_phys) {
     return 0;
 }
 
+int vmm_query_page(uint32_t virt, uint32_t* out_phys, uint32_t* out_flags) {
+    if (!out_phys && !out_flags) {
+        return -1;
+    }
+
+    if (!paging_is_enabled()) {
+        if (out_phys) {
+            *out_phys = virt;
+        }
+        if (out_flags) {
+            *out_flags = PAGE_PRESENT | PAGE_RW;
+        }
+        return 0;
+    }
+
+    uint32_t dir_idx   = virt >> 22;
+    uint32_t table_idx = (virt >> 12) & 0x3FF;
+
+    uint32_t* pd = (uint32_t*)RECURSIVE_PD_BASE;
+    uint32_t pde = pd[dir_idx];
+    if (!(pde & PAGE_PRESENT)) {
+        return -1;
+    }
+
+    uint32_t* pt = (uint32_t*)(RECURSIVE_PT_BASE + dir_idx * PAGE_SIZE);
+    uint32_t pte = pt[table_idx];
+    if (!(pte & PAGE_PRESENT)) {
+        return -1;
+    }
+
+    if (out_phys) {
+        *out_phys = (pte & 0xFFFFF000u) | (virt & 0xFFFu);
+    }
+    if (out_flags) {
+        *out_flags = (pde & 0xFFFu) | (pte & 0xFFFu);
+    }
+    return 0;
+}
+
 int vmm_mark_user_range(uint32_t virt, size_t size) {
     if (size == 0)
         return 0;
@@ -306,38 +409,56 @@ void paging_set_current_dir(uint32_t* dir, uint32_t phys) {
     if (!dir || phys == 0) {
         return;
     }
+    paging_sync_kernel_pdes(dir);
     current_page_directory = dir;
     current_page_directory_phys = phys;
     load_pd((uint32_t*)phys);
 }
 
 uint32_t* paging_create_user_dir(uint32_t* out_phys) {
-    uint32_t phys = 0;
-    uint32_t* dir = (uint32_t*)kmalloc(PAGE_SIZE, PAGE_SIZE, &phys);
-    if (!dir) {
+    uint32_t dir_phys = (uint32_t)pmm_alloc_page();
+    if (!dir_phys) {
         return NULL;
     }
-    memset(dir, 0, PAGE_SIZE);
 
     uint32_t* prev_dir = paging_current_dir();
     uint32_t prev_phys = paging_current_dir_phys();
     uint32_t low_tables[16] = {0};
 
     paging_set_current_dir(kernel_page_directory, kernel_page_directory_phys);
+    uint32_t* dir = paging_map_struct_page(dir_phys);
+    if (!dir) {
+        paging_set_current_dir(prev_dir, prev_phys);
+        pmm_free_page((void*)dir_phys);
+        return NULL;
+    }
+    memset(dir, 0, PAGE_SIZE);
+
     for (uint32_t i = 0; i < 16; i++) {
         if (!(kernel_page_directory[i] & PAGE_PRESENT)) {
             continue;
         }
-        uint32_t pt_phys = 0;
-        uint32_t* pt = (uint32_t*)kmalloc(PAGE_SIZE, PAGE_SIZE, &pt_phys);
-        if (!pt) {
+        uint32_t pt_phys = (uint32_t)pmm_alloc_page();
+        if (!pt_phys) {
             paging_set_current_dir(prev_dir, prev_phys);
             for (uint32_t j = 0; j < 16; j++) {
                 if (low_tables[j]) {
-                    kfree((void*)low_tables[j]);
+                    pmm_free_page((void*)low_tables[j]);
                 }
             }
-            kfree(dir);
+            pmm_free_page((void*)dir_phys);
+            return NULL;
+        }
+        uint32_t* pt = paging_map_struct_page(pt_phys);
+        if (!pt) {
+            paging_set_current_dir(prev_dir, prev_phys);
+            pmm_free_page((void*)pt_phys);
+            for (uint32_t j = 0; j < 16; j++) {
+                if (low_tables[j]) {
+                    pmm_free_page((void*)low_tables[j]);
+                }
+            }
+            pmm_free_page((void*)dir_phys);
             return NULL;
         }
         uint32_t* src_pt = (uint32_t*)(RECURSIVE_PT_BASE + i * PAGE_SIZE);
@@ -345,17 +466,21 @@ uint32_t* paging_create_user_dir(uint32_t* out_phys) {
         uint32_t flags = kernel_page_directory[i] & 0xFFFu;
         flags &= ~PAGE_USER;
         dir[i] = (pt_phys & 0xFFFFF000u) | flags;
-        low_tables[i] = (uint32_t)pt;
+        low_tables[i] = pt_phys;
     }
     paging_set_current_dir(prev_dir, prev_phys);
 
-    for (uint32_t i = 768; i < 1023; i++) {
-        dir[i] = kernel_page_directory[i];
-    }
-    dir[1023] = (phys & 0xFFFFF000u) | PAGE_PRESENT | PAGE_RW;
+    /* Copy kernel PDE region (upper 1GB: 0xC0000000~0xFFFFFFFF). */
+    memcpy(&dir[768], &kernel_page_directory[768], (1024 - 768) * sizeof(uint32_t));
+    /*
+     * Keep recursive mapping private to this page directory.
+     * If we leave dir[1023] copied from kernel, recursive PD/PT access points
+     * to kernel page directory instead of this process directory.
+     */
+    dir[1023] = (dir_phys & 0xFFFFF000u) | PAGE_PRESENT | PAGE_RW;
 
     if (out_phys) {
-        *out_phys = phys;
+        *out_phys = dir_phys;
     }
     return dir;
 }

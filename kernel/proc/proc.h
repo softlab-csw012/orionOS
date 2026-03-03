@@ -7,17 +7,27 @@
 
 #define MAX_PROCS 16
 #define PROC_NAME_MAX 32
+#define PROC_SIGNAL_QUEUE_SIZE 16
+#define PROC_ARGC_MAX 16
+#define PROC_ARG_MAX  128
+
+#define PROC_SIG_NONE 0u
+#define PROC_SIG_INT  2u
+#define PROC_SIG_TERM 15u
 
 typedef enum {
     PROC_UNUSED = 0,
     PROC_READY,
     PROC_RUNNING,
     PROC_BLOCKED,
+    PROC_ZOMBIE,
     PROC_EXITED
 } proc_state_t;
 
 typedef struct {
     uint32_t pid;
+    uint32_t uid;
+    uint32_t gid;
     char name[PROC_NAME_MAX];
     uint32_t entry;
     uint32_t image_base;
@@ -30,9 +40,13 @@ typedef struct {
     uint32_t kstack_size;
     uint32_t context_esp;
     uint32_t exit_code;
-    uint32_t vfork_parent_pid;
     uint32_t page_dir;
     uint32_t page_dir_phys;
+    int32_t argc_saved;
+    char argv_saved[PROC_ARGC_MAX][PROC_ARG_MAX];
+    uint8_t sig_head;
+    uint8_t sig_tail;
+    uint8_t sig_queue[PROC_SIGNAL_QUEUE_SIZE];
     proc_state_t state;
     bool is_kernel;
 } process_t;
@@ -48,7 +62,8 @@ typedef enum {
     PROC_KILL_INVALID,
     PROC_KILL_NO_SUCH,
     PROC_KILL_KERNEL,
-    PROC_KILL_ALREADY_EXITED
+    PROC_KILL_ALREADY_EXITED,
+    PROC_KILL_PERM
 } proc_kill_result_t;
 
 void proc_init(void);
@@ -75,9 +90,10 @@ process_t* proc_lookup(uint32_t pid);
 bool proc_pid_exited(uint32_t pid, uint32_t* exit_code);
 process_t* proc_fork(registers_t* regs);
 bool proc_exec(process_t* p, uint32_t entry, uint32_t image_base, uint32_t image_size,
-               uint32_t image_load_base, const char* const* argv, int argc);
-void proc_wake_vfork_parent(process_t* child);
+               uint32_t image_load_base, const char* image_name,
+               const char* const* argv, int argc);
 bool proc_make_current(process_t* p, registers_t* regs);
+bool proc_yield(void);
 bool proc_schedule(registers_t* regs, bool save_current);
 bool proc_has_runnable(void);
 process_t* proc_take_next(void);
@@ -90,8 +106,10 @@ void proc_cleanup_process(process_t* p);
 bool proc_start_reaper(void);
 void proc_exit_trampoline(void);
 void proc_request_kill(void);
+void proc_request_kill_pid(uint32_t pid);
 bool proc_handle_kill(registers_t* regs);
-__attribute__((noreturn)) void proc_start(uint32_t context_esp);
+bool proc_signal_enqueue(uint32_t pid, uint8_t sig);
+bool proc_handle_signals(registers_t* regs);
 
 extern volatile uint32_t sched_next_esp;
 

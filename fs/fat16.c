@@ -1,7 +1,7 @@
 #include "fat16.h"
 #include "fscmd.h"
-#include "../drivers/ata.h"
-#include "../drivers/screen.h"
+#include "../drivers/blockdev.h"
+#include "../kernel/io/console.h"
 #include "../libc/string.h"
 #include "../mm/mem.h"
 #include "../kernel/cmd.h"
@@ -107,7 +107,7 @@ static int has_sig55AA(const uint8_t *sec) {
 
 static int probe_fat16_pbr(uint8_t drive, uint32_t base_lba, FAT16_BPB_t *out_bpb) {
     uint8_t sec[512];
-    if (!ata_read(drive, base_lba, 1, sec)) return 0;
+    if (!blockdev_read(drive, base_lba, 1, sec)) return 0;
     if (!has_sig55AA(sec) || !is_valid_bootjmp(sec)) return 0;
 
     FAT16_BPB_t bpb;
@@ -140,7 +140,7 @@ static int probe_fat16_pbr(uint8_t drive, uint32_t base_lba, FAT16_BPB_t *out_bp
 // MBR을 읽어 FAT16 파티션을 찾아 base_lba 반환 (없으면 0)
 static int find_fat16_in_mbr(uint8_t drive, uint32_t *out_base_lba, FAT16_BPB_t *out_bpb) {
     uint8_t sec[512];
-    if (!ata_read(drive, 0, 1, sec)) return 0;
+    if (!blockdev_read(drive, 0, 1, sec)) return 0;
     if (!has_sig55AA(sec)) return 0; // MBR 아님일 수도 있음
 
     kprint("MBR found on drive "); print_hex(drive); kprint("\n");
@@ -204,10 +204,10 @@ bool fat16_init(uint8_t drive, uint32_t base_lba) {
 }
 
 static void read_sector(uint32_t lba, uint8_t* buffer) {
-    ata_read(fat16_drive, lba, 1, buffer);
+    blockdev_read(fat16_drive, lba, 1, buffer);
 }
 static void write_sector(uint32_t lba, uint8_t* buffer) {
-    ata_write(fat16_drive, lba, 1, buffer);
+    blockdev_write(fat16_drive, lba, 1, buffer);
 }
 
 // ───────────── 일반 디렉토리용 함수들 ─────────────
@@ -358,7 +358,7 @@ bool _root_find_free_pos(uint32_t* out_lba, uint16_t* out_off) {
     uint32_t entries_per_sector = fat16_bpb.BytsPerSec / sizeof(FAT16_DirEntry);
     for (uint32_t i=0; i<root_dir_sectors; i++) {
         uint32_t lba = root_dir_lba + i;
-        ata_read(fat16_drive, lba, 1, sector);
+        blockdev_read(fat16_drive, lba, 1, sector);
         for (uint32_t j=0; j<entries_per_sector; j++) {
             FAT16_DirEntry* de = (FAT16_DirEntry*)(sector + j*sizeof(FAT16_DirEntry));
             if ((uint8_t)de->Name[0] == 0x00 || (uint8_t)de->Name[0] == 0xE5) {
@@ -373,18 +373,18 @@ bool _root_find_free_pos(uint32_t* out_lba, uint16_t* out_off) {
 
 static void _write_entry_at(uint32_t lba, uint16_t byte_offset, const FAT16_DirEntry* de) {
     uint8_t sector[512];
-    ata_read(fat16_drive, lba, 1, sector);
+    blockdev_read(fat16_drive, lba, 1, sector);
 
     memcpy(sector + byte_offset, de, sizeof(FAT16_DirEntry));
 
-    ata_write(fat16_drive, lba, 1, sector);
+    blockdev_write(fat16_drive, lba, 1, sector);
 }
 
 static void _root_write_entry_at(uint32_t lba, uint16_t offset, const FAT16_DirEntry* entry) {
     uint8_t sector[512];
-    ata_read(fat16_drive, lba, 1, sector);
+    blockdev_read(fat16_drive, lba, 1, sector);
     memcpy(sector + offset, entry, sizeof(FAT16_DirEntry));
-    ata_write(fat16_drive, lba, 1, sector);
+    blockdev_write(fat16_drive, lba, 1, sector);
 }
 
 static uint16_t _alloc_cluster(void) {
@@ -1163,7 +1163,7 @@ bool _root_find_entry_pos(const char* filename,
 
     for (uint32_t i=0; i<root_dir_sectors; i++) {
         uint32_t lba = root_dir_lba + i;
-        ata_read(fat16_drive, lba, 1, sector);
+        blockdev_read(fat16_drive, lba, 1, sector);
 
         for (uint32_t j=0; j<entries_per_sector; j++) {
             FAT16_DirEntry* de = (FAT16_DirEntry*)(sector + j*sizeof(FAT16_DirEntry));
@@ -1237,7 +1237,7 @@ bool fat16_find_file_raw(const char* filename, uint32_t* sector_out, uint16_t* o
     for (int s = 0; s < fat16_bpb.RootEntCnt * 32 / 512; s++) {
         sector = root_dir_lba + s;
         uint8_t buf[512];
-        ata_read_sector(fat16_drive, sector, buf);
+        blockdev_read_sector(fat16_drive, sector, buf);
 
         for (int i = 0; i < 512; i += 32) {
             if (buf[i] == 0x00) break;
@@ -1261,7 +1261,7 @@ uint16_t fat16_get_fat_entry(uint16_t cluster) {
     uint32_t offset_in_sector = fat_offset % fat16_bpb.BytsPerSec;
 
     uint8_t sector[512];
-    ata_read(fat16_drive, fat_sector, 1, sector);
+    blockdev_read(fat16_drive, fat_sector, 1, sector);
 
     return *(uint16_t*)(sector + offset_in_sector);
 }
@@ -1269,7 +1269,7 @@ uint16_t fat16_get_fat_entry(uint16_t cluster) {
 void fat16_read_cluster(uint16_t cluster, uint8_t* buffer) {
     uint32_t lba = data_region_lba + (cluster - 2) * fat16_bpb.SecPerClus;
     for (uint8_t i = 0; i < fat16_bpb.SecPerClus; i++) {
-        ata_read(fat16_drive, lba + i, 1, buffer + (i * 512));
+        blockdev_read(fat16_drive, lba + i, 1, buffer + (i * 512));
     }
 }
 
@@ -1282,7 +1282,7 @@ bool fat16_write_cluster(uint16_t cluster, const uint8_t* buf) {
     uint32_t start_lba = first_data_lba + 
                          (uint32_t)(cluster - 2) * fat16_bpb.SecPerClus;
 
-    if (!ata_write(fat16_drive, start_lba, fat16_bpb.SecPerClus, buf)) {
+    if (!blockdev_write(fat16_drive, start_lba, fat16_bpb.SecPerClus, buf)) {
         kprintf("[FAT16] write fail at cluster %u\n", cluster);
         return false;
     }
@@ -1297,9 +1297,9 @@ void fat16_set_fat_entry(uint16_t cluster, uint16_t value) {
         uint32_t offset_in_sector = fat_offset % 512;
 
         uint8_t sector[512];
-        ata_read(fat16_drive, fat_sector, 1, sector);
+        blockdev_read(fat16_drive, fat_sector, 1, sector);
         *(uint16_t*)(sector + offset_in_sector) = value;
-        ata_write(fat16_drive, fat_sector, 1, sector);
+        blockdev_write(fat16_drive, fat_sector, 1, sector);
     }
 }
 
@@ -1349,10 +1349,13 @@ void fat16_ls(const char* path) {
 
     if (!path || path[0] == '\0') {
         cluster = current_dir_cluster16;
+        if (cluster == 0 || cluster == 0xFFFF) {
+            cluster = (uint16_t)root_dir_cluster16;
+        }
     } else {
         cluster = fat16_resolve_dir(path);
         if (cluster == 0xFFFF) {
-            kprint("fl: invalid path\n");
+            kprint("dir: invalid path\n");
             return;
         }
     }
@@ -1491,12 +1494,12 @@ void fat16_cat(const char* path) {
 
     // 파일 엔트리 찾기 (경로 전체 지원)
     if (!fat16_find_file_path(path, &entry)) {
-        kprint("cat: file not found\n");
+        kprint("view: file not found\n");
         return;
     }
 
     if (fat16_is_dir(&entry)) {
-        kprint("cat: is a directory\n");
+        kprint("view: is a directory\n");
         return;
     }
 
@@ -1716,14 +1719,14 @@ int fat16_write_file(const char* filename, const char* data, int size) {
         uint32_t tail_bytes = tocpy % SECTOR_SIZE;
 
         if (full_sectors > 0) {
-            ata_write(fat16_drive, lba, (uint16_t)full_sectors, p);
+            blockdev_write(fat16_drive, lba, (uint16_t)full_sectors, p);
         }
 
         if (tail_bytes > 0) {
             uint8_t tmp[SECTOR_SIZE];
             memset(tmp, 0, SECTOR_SIZE);
             memcpy(tmp, p + (full_sectors * SECTOR_SIZE), tail_bytes);
-            ata_write(fat16_drive, lba + full_sectors, 1, tmp);
+            blockdev_write(fat16_drive, lba + full_sectors, 1, tmp);
         }
 
         remaining -= tocpy;
@@ -1780,7 +1783,7 @@ bool fat16_rm(const char* path) {
 
         uint32_t start_lba = lba_of_cluster(cl);
         for (int i = 0; i < fat16_bpb.SecPerClus; i++) {
-            ata_write(fat16_drive, start_lba + i, 1, zero);
+            blockdev_write(fat16_drive, start_lba + i, 1, zero);
         }
 
         fat16_set_fat_entry(cl, 0x0000);
@@ -1807,7 +1810,7 @@ bool fat16_find_entry(const char* name, uint16_t dir_cluster, FAT16_DirEntry* ou
 uint16_t fat16_next_cluster(uint16_t cluster) {
     uint32_t fat_lba = fat_start_lba + (cluster * 2) / 512;
     uint8_t sector[512];
-    ata_read(fat16_drive, fat_lba, 1, sector);
+    blockdev_read(fat16_drive, fat_lba, 1, sector);
 
     int offset = (cluster * 2) % 512;
     return *((uint16_t*)(sector + offset));
@@ -1819,7 +1822,7 @@ int fat16_read_dir(uint16_t cluster, FAT16_DirEntry* out_entries, int max_entrie
 
     if (cluster == 0) {
         for (uint32_t i = 0; i < root_dir_sectors && count < max_entries; i++) {
-            ata_read(fat16_drive, root_dir_lba + i, 1, sector);
+            blockdev_read(fat16_drive, root_dir_lba + i, 1, sector);
             FAT16_DirEntry* entries = (FAT16_DirEntry*)sector;
             for (size_t j = 0; j < (512 / sizeof(FAT16_DirEntry)) && count < max_entries; j++) {
                 if (entries[j].Name[0] == 0x00) {
@@ -1836,7 +1839,7 @@ int fat16_read_dir(uint16_t cluster, FAT16_DirEntry* out_entries, int max_entrie
         while (current < 0xFFF8 && count < max_entries) {
             uint32_t lba = cluster_to_lba(current);
             for (int s = 0; s < fat16_bpb.SecPerClus; s++) {
-                ata_read(fat16_drive, lba + s, 1, sector);
+                blockdev_read(fat16_drive, lba + s, 1, sector);
                 FAT16_DirEntry* entries = (FAT16_DirEntry*)sector;
                 for (size_t j = 0; j < (512 / sizeof(FAT16_DirEntry)) && count < max_entries; j++) {
                     if (entries[j].Name[0] == 0x00) {
@@ -2024,12 +2027,12 @@ bool fat16_mkdir(const char* dirname) {
     dotdot->FirstCluster = parent;
     dotdot->FileSize = 0;
 
-    ata_write(fat16_drive, cluster_to_lba(new_cl), 1, sector);
+    blockdev_write(fat16_drive, cluster_to_lba(new_cl), 1, sector);
     if (fat16_bpb.SecPerClus > 1) {
         uint8_t zero[512];
         memset(zero, 0, sizeof(zero));
         for (uint8_t s = 1; s < fat16_bpb.SecPerClus; s++)
-            ata_write(fat16_drive, cluster_to_lba(new_cl) + s, 1, zero);
+            blockdev_write(fat16_drive, cluster_to_lba(new_cl) + s, 1, zero);
     }
 
     return true;
@@ -2040,7 +2043,7 @@ bool is_dir_empty(uint16_t clus) {
     uint32_t lba = lba_of_cluster(clus);
 
     for (int i = 0; i < fat16_bpb.SecPerClus; i++) {
-        ata_read(fat16_drive, lba + i, 1, sector);
+        blockdev_read(fat16_drive, lba + i, 1, sector);
 
         for (size_t j = 0; j < 512 / sizeof(FAT16_DirEntry); j++) {
             FAT16_DirEntry* entry = (FAT16_DirEntry*)&sector[j * 32];
@@ -2358,7 +2361,7 @@ uint32_t fat16_free_clusters() {
     uint32_t total_fat_sectors = fat16_bpb.FATSz16;
 
     for (uint32_t s = 0; s < total_fat_sectors; s++) {
-        if (!ata_read(fat16_drive, fat_start + s, 1, sector))
+        if (!blockdev_read(fat16_drive, fat_start + s, 1, sector))
             continue;
 
         for (uint32_t i = 0; i < entries_per_sector; i++) {
@@ -2443,7 +2446,7 @@ bool fat16_format_at(uint8_t drive, uint32_t base_lba, uint32_t total_sectors, c
     sector[510] = 0x55;
     sector[511] = 0xAA;
 
-    ata_write_sector(drive, base_lba + 0, sector);
+    blockdev_write_sector(drive, base_lba + 0, sector);
 
     /* ────────────────
        FAT 테이블 초기화
@@ -2457,7 +2460,7 @@ bool fat16_format_at(uint8_t drive, uint32_t base_lba, uint32_t total_sectors, c
     uint32_t fat_start = base_lba + bpb.RsvdSecCnt;
     for (uint8_t f = 0; f < bpb.NumFATs; f++) {
         for (uint32_t i = 0; i < bpb.FATSz16; i++) {
-            ata_write_sector(drive, fat_start + f * bpb.FATSz16 + i, sector);
+            blockdev_write_sector(drive, fat_start + f * bpb.FATSz16 + i, sector);
             memset(sector, 0, 512);
         }
     }
@@ -2473,7 +2476,7 @@ bool fat16_format_at(uint8_t drive, uint32_t base_lba, uint32_t total_sectors, c
 
     for (uint32_t s = 0; s < root_sectors; s++) {
         memset(sector, 0, 512);
-        ata_write_sector(drive, root_start + s, sector);
+        blockdev_write_sector(drive, root_start + s, sector);
     }
 
     kprintf("[FAT16] Format complete.\n");
@@ -2482,6 +2485,6 @@ bool fat16_format_at(uint8_t drive, uint32_t base_lba, uint32_t total_sectors, c
 }
 
 bool fat16_format(uint8_t drive, const char* label) {
-    uint32_t total_sectors = ata_get_sector_count(drive);
+    uint32_t total_sectors = blockdev_get_sector_count(drive);
     return fat16_format_at(drive, 0, total_sectors, label);
 }

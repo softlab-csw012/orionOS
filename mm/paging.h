@@ -32,5 +32,7 @@ int vmm_map_page(uint32_t virt, uint32_t phys, uint32_t flags);
 int vmm_map_page_alloc(uint32_t virt, uint32_t flags, uint32_t* out_phys);
 int vmm_map_range_alloc(uint32_t virt, size_t size, uint32_t flags);
 int vmm_virt_to_phys(uint32_t virt, uint32_t* out_phys);
+int vmm_query_page(uint32_t virt, uint32_t* out_phys, uint32_t* out_flags);
 int vmm_mark_user_range(uint32_t virt, size_t size);
 bool paging_pat_wc_enabled(void);
+uint32_t paging_wc_cache_flags(void);

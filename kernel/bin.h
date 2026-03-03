@@ -8,7 +8,6 @@
 #define BIN_LOAD_ADDR   0x500000
 #define BIN_MAX_SIZE    (64 * 1024)
 
-bool load_bin(const char* path, uint32_t* phys_entry, uint32_t* out_size);
 bool bin_load_image(const char* path, uint32_t* out_entry, uint32_t* out_image_base,
                     uint32_t* out_image_size, uint32_t* out_load_base);
 void jump_to_bin(uint32_t entry, uint32_t stack_top);

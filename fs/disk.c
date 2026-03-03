@@ -1,8 +1,8 @@
 #include "disk.h"
-#include "../drivers/ata.h"
+#include "../drivers/blockdev.h"
 #include "../mm/mem.h"
 #include "../libc/string.h"
-#include "../drivers/screen.h"
+#include "../kernel/io/console.h"
 #include "../drivers/ramdisk.h"
 #include "../kernel/proc/workqueue.h"
 #include "fat16.h"
@@ -73,6 +73,10 @@ static inline bool is_fat_sig(const uint8_t *sec, const char *sig8) {
            (memcmp(sec + 0x52, sig8, 8) == 0);    // mkfs.fat 등
 }
 
+static inline bool is_xvfs_bootsig(const uint8_t* sec0) {
+    return (memcmp(sec0, "XVFS3", 5) == 0) || (memcmp(sec0, "XVFS2", 5) == 0);
+}
+
 static void trim_label(char* s) {
     size_t len = strlen(s);
     while (len > 0 && s[len - 1] == ' ')
@@ -93,7 +97,7 @@ static void read_volume_label(uint8_t drive, uint32_t base_lba,
         return;
 
     uint8_t sec[512];
-    if (!ata_read(drive, base_lba, 1, sec))
+    if (!blockdev_read(drive, base_lba, 1, sec))
         return;
 
     uint32_t off = (strcmp(fs_type, "FAT32") == 0) ? 0x47 : 0x2B;
@@ -110,9 +114,9 @@ static void read_volume_label(uint8_t drive, uint32_t base_lba,
 
 static inline bool is_xvfs_sig_at(uint8_t drive, uint32_t base_lba) {
     uint8_t sec0[512], sec1[512];
-    if (!ata_read(drive, base_lba + 0, 1, sec0)) return false;
-    if (memcmp(sec0, "XVFS2", 5) != 0) return false;
-    if (!ata_read(drive, base_lba + 1, 1, sec1)) return false;
+    if (!blockdev_read(drive, base_lba + 0, 1, sec0)) return false;
+    if (!is_xvfs_bootsig(sec0)) return false;
+    if (!blockdev_read(drive, base_lba + 1, 1, sec1)) return false;
     uint32_t magic = *(uint32_t*)sec1;
     return (magic == 0x58564653);
 }
@@ -121,11 +125,11 @@ static inline bool is_xvfs_sig(uint8_t drive) {
     uint8_t sec0[512], sec1[512];
 
     // 0번 섹터 읽기 (부트 블록)
-    if (!ata_read(drive, 0, 1, sec0)) return false;
-    if (memcmp(sec0, "XVFS2", 5) != 0) return false;
+    if (!blockdev_read(drive, 0, 1, sec0)) return false;
+    if (!is_xvfs_bootsig(sec0)) return false;
 
     // 1번 섹터 읽기 (슈퍼블록)
-    if (!ata_read(drive, 1, 1, sec1)) return false;
+    if (!blockdev_read(drive, 1, 1, sec1)) return false;
     uint32_t magic = *(uint32_t*)sec1;
     if (magic != 0x58564653) return false;
 
@@ -136,7 +140,7 @@ fs_kind_t fs_quick_probe(uint8_t drive, uint32_t *out_base_lba) {
     uint8_t sec[512];
 
     // 장치 유무는 섹터0 읽기 성공 여부로만 판단
-    if (!ata_read(drive, 0, 1, sec)) return FSQ_NONE;
+    if (!blockdev_read(drive, 0, 1, sec)) return FSQ_NONE;
     if (!has_55aa(sec)) return FSQ_UNKNOWN;
 
     // ─────────────────────────────
@@ -169,7 +173,7 @@ fs_kind_t fs_quick_probe(uint8_t drive, uint32_t *out_base_lba) {
             uint32_t base = p[i].lba_first;
             if (out_base_lba) *out_base_lba = base;
 
-            if (ata_read(drive, base, 1, sec) && has_55aa(sec)) {
+            if (blockdev_read(drive, base, 1, sec) && has_55aa(sec)) {
                 if (is_fat_sig(sec, "FAT16   ")) return FSQ_FAT16;
                 if (is_fat_sig(sec, "FAT32   ")) return FSQ_FAT32;
                 if (is_xvfs_sig_at(drive, base)) return FSQ_XVFS;  // ⚡ 파티션 내부에서도 체크
@@ -184,7 +188,7 @@ fs_kind_t fs_quick_probe(uint8_t drive, uint32_t *out_base_lba) {
 
 void detect_disks_quick(void) {
     disk_count = 0;
-    ata_refresh_drive_map();
+    blockdev_refresh_drive_map();
     kprint("[DISK] Quick detection start\n");
 
     for (uint8_t d = 0; d < MAX_DISKS; d++) {
@@ -203,7 +207,7 @@ void detect_disks_quick(void) {
 
         // NTFS 필터: FAT 시그니처 없고 "NTFS" 문자열 포함 시 Unknown 처리
         uint8_t sec[512];
-        if (ata_read(d, base, 1, sec)) {
+        if (blockdev_read(d, base, 1, sec)) {
             if (memcmp(sec + 0x03, "NTFS", 4) == 0 || memcmp(sec + 0x52, "NTFS", 4) == 0) {
                 kprintf("[DISK] drive %d > NTFS detected, marking Unknown\n", d);
                 kind = FSQ_UNKNOWN;
@@ -264,7 +268,7 @@ void cmd_disk_ls() {
         model[0] = '\0';
         label[0] = '\0';
 
-        if (!ata_drive_model(id, model, sizeof(model))) {
+        if (!blockdev_drive_model(id, model, sizeof(model))) {
             strcpy(model, "Unknown");
         }
         read_volume_label(id, base, fs, label, sizeof(label));
@@ -275,30 +279,19 @@ void cmd_disk_ls() {
         }
         kprintf("\n");
 
-        ata_backend_t backend = ATA_BACKEND_NONE;
-        const char* backend_name = "unknown";
-        if (ata_drive_backend(id, &backend, NULL)) {
-            switch (backend) {
-            case ATA_BACKEND_AHCI:
-                backend_name = "ahci";
-                break;
-            case ATA_BACKEND_PATA:
-                backend_name = "pata";
-                break;
-            case ATA_BACKEND_USB:
-                backend_name = "usb";
-                break;
-            case ATA_BACKEND_RAMDISK:
-                backend_name = "ram";
-                break;
-            default:
-                backend_name = "unknown";
-                break;
-            }
+        blockdev_backend_t backend = BLOCKDEV_BACKEND_NONE;
+        int backend_index = -1;
+        if (!blockdev_drive_backend(id, &backend, &backend_index)) {
+            backend = BLOCKDEV_BACKEND_NONE;
         }
+        const char* backend_name = blockdev_backend_name(backend);
 
         const char* layout = (base == 0) ? "superfloppy" : "partitioned";
-        kprintf("    %s%d . %s . LBA %u\n", backend_name, id, layout, base);
+        kprintf("    /dev/disk%d -> drive %d", id, id);
+        if (backend != BLOCKDEV_BACKEND_NONE && backend_index >= 0) {
+            kprintf(" (/dev/%s%d)", backend_name, backend_index);
+        }
+        kprintf(" . %s . LBA %u\n", layout, base);
     }
 
     kprintf("[DISK] Total %d drive(s) detected.\n", disk_count);

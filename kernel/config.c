@@ -1,6 +1,6 @@
 #include "config.h"
 #include "kernel.h"
-#include "../drivers/screen.h"
+#include "io/console.h"
 #include "../drivers/spk.h"
 #include "../fs/fscmd.h"
 #include "../libc/string.h"

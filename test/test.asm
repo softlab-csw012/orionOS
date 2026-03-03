@@ -1,33 +1,53 @@
 [bits 32]
-[org 0x500000]
+global _start
 
-start:
-    mov eax, 12
-    mov ebx, con
+SYS_READ  equ 2
+SYS_WRITE equ 3
+SYS_EXIT  equ 1
+
+section .data
+msg db "input: ",0
+msg_len equ $-msg
+
+section .bss
+buf resb 64
+
+section .text
+
+; write(fd, buf, len)
+write:
+    mov eax, SYS_WRITE
     int 0xA5
+    iret
 
-    mov [fd], eax
-
-    mov eax, 14
-    mov ebx, [fd]
-    mov edx, msg
-    mov ecx, len
+; read(fd, buf, len)
+read:
+    mov eax, SYS_READ
     int 0xA5
+    iret
 
-    mov eax, 15
-    mov ebx, [fd]
+_start:
+
+    ; print prompt
+    mov ebx, 1          ; stdout
+    mov ecx, msg
+    mov edx, msg_len
+    call write
+
+    ; read stdin
+    mov ebx, 0          ; stdin
+    mov ecx, buf
+    mov edx, 64
+    call read
+    mov esi, eax        ; bytes read 저장
+
+    ; echo back
+    mov ebx, 1
+    mov ecx, buf
+    mov edx, esi
+    call write
+
+    ; exit
+    mov eax, SYS_EXIT
+    xor ebx, ebx
     int 0xA5
-
-loop:
-    jmp loop
-
-;mov eax, 8
-;mov ebx, 0
-;int 0xA5
-
-con: db "console", 0
-
-msg: db "Hello, world!", 10
-len equ $ - msg
-
-fd: dd 0

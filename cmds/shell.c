@@ -1,274 +1,52 @@
 #include "syscall.h"
 #include "string.h"
+#include "stdio.h"
 #include <stdint.h>
 #include <stdbool.h>
 
 #define MAX_LINE 256
 #define MAX_ARGS 16
-#define MAX_HISTORY 16
-#define PROMPT "sh> "
+#define MAX_PIPE_CMDS 8
+#define MAX_FUNCS 16
+#define MAX_FUNC_NAME 32
+#define MAX_FUNC_BODY 192
+#define PROMPT "orion:#=> "
 
-#define NOTE_KEY_LEFT 0x90
-#define NOTE_KEY_RIGHT 0x91
-#define NOTE_KEY_UP 0x92
-#define NOTE_KEY_DOWN 0x93
+typedef struct {
+    bool used;
+    char name[MAX_FUNC_NAME];
+    char body[MAX_FUNC_BODY];
+} shell_func_t;
 
-static int con_fd = -1;
-static char history[MAX_HISTORY][MAX_LINE];
-static int history_count = 0;
-static int history_head = 0;
-
-static void console_fallback_write(const char* s, uint32_t len) {
-    if (!s || len == 0) {
-        return;
-    }
-    char buf[128];
-    while (len > 0) {
-        uint32_t chunk = len < (sizeof(buf) - 1u) ? len : (uint32_t)(sizeof(buf) - 1u);
-        memcpy(buf, s, chunk);
-        buf[chunk] = '\0';
-        sys_kprint(buf);
-        s += chunk;
-        len -= chunk;
-    }
-}
-
-static void console_write_len(const char* s, uint32_t len) {
-    if (!s || len == 0) {
-        return;
-    }
-    if (con_fd < 0) {
-        con_fd = sys_open("console");
-    }
-    if (con_fd >= 0) {
-        int rc = sys_write(con_fd, s, len);
-        if (rc < 0) {
-            con_fd = -1;
-            con_fd = sys_open("console");
-            if (con_fd >= 0) {
-                rc = sys_write(con_fd, s, len);
-            }
-            if (rc < 0) {
-                console_fallback_write(s, len);
-            }
-        }
-    } else {
-        console_fallback_write(s, len);
-    }
-}
-
-static void console_write(const char* s) {
-    if (!s) {
-        return;
-    }
-    console_write_len(s, (uint32_t)strlen(s));
-}
-
-static void console_write_char(char c) {
-    console_write_len(&c, 1);
-}
-
-static void console_write_u32(uint32_t value) {
-    char buf[16];
-    itoa((int)value, buf, 10);
-    console_write(buf);
-}
-
-static void console_write_i32(int value) {
-    char buf[16];
-    itoa(value, buf, 10);
-    console_write(buf);
-}
-
-static void exec_error_message(int rc) {
-    const char* msg = "unknown error";
-    switch (rc) {
-        case EXEC_ERR_FAULT: msg = "bad address"; break;
-        case EXEC_ERR_NOENT: msg = "no such file"; break;
-        case EXEC_ERR_NOEXEC: msg = "invalid executable"; break;
-        case EXEC_ERR_NOMEM: msg = "out of memory"; break;
-        case EXEC_ERR_INVAL: msg = "invalid argument"; break;
-        case EXEC_ERR_PERM: msg = "permission denied"; break;
-        default: break;
-    }
-    console_write("exec failed: ");
-    console_write(msg);
-    console_write(" (");
-    console_write_i32(rc);
-    console_write(")\n");
-}
-
-static void print_prompt(void) {
-    console_write(PROMPT);
-}
+static shell_func_t g_funcs[MAX_FUNCS];
 
 static int is_space(char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
-static void history_push(const char* line) {
-    if (!line || !*line) {
-        return;
-    }
-    if (history_count > 0) {
-        int last = history_head - 1;
-        if (last < 0) {
-            last += MAX_HISTORY;
-        }
-        if (strcmp(history[last], line) == 0) {
-            return;
-        }
-    }
-    strncpy(history[history_head], line, MAX_LINE - 1);
-    history[history_head][MAX_LINE - 1] = '\0';
-    history_head = (history_head + 1) % MAX_HISTORY;
-    if (history_count < MAX_HISTORY) {
-        history_count++;
-    }
+static bool is_name_start(char c) {
+    return (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z') ||
+           c == '_';
 }
 
-static const char* history_get(int view) {
-    if (view < 0 || view >= history_count) {
-        return NULL;
-    }
-    int idx = history_head - 1 - view;
-    while (idx < 0) {
-        idx += MAX_HISTORY;
-    }
-    idx %= MAX_HISTORY;
-    return history[idx];
-}
-
-static void redraw_line(const char* buf, int len, int cur, int* last_len, uint32_t prompt_offset) {
-    sys_set_cursor_offset(prompt_offset);
-    if (len > 0) {
-        console_write_len(buf, (uint32_t)len);
-    }
-    int tail = *last_len - len;
-    for (int i = 0; i < tail; i++) {
-        console_write_char(' ');
-    }
-    sys_set_cursor_offset(prompt_offset + (uint32_t)(cur * 2));
-    *last_len = len;
-}
-
-static void replace_input_line(char* out, int* len, int* cur, int max_len, const char* src,
-                               int* last_len, uint32_t prompt_offset) {
-    if (!src) {
-        src = "";
-    }
-    strncpy(out, src, max_len - 1);
-    out[max_len - 1] = '\0';
-    *len = (int)strlen(out);
-    *cur = *len;
-    redraw_line(out, *len, *cur, last_len, prompt_offset);
+static bool is_name_char(char c) {
+    return is_name_start(c) || (c >= '0' && c <= '9');
 }
 
 static int read_line(char* out, int max_len) {
-    int len = 0;
-    int cur = 0;
-    int last_len = 0;
-    int history_view = -1;
-    bool history_saved = false;
-    char history_scratch[MAX_LINE];
-    uint32_t prompt_offset = sys_get_cursor_offset();
-    if (!out || max_len <= 1) {
+    int n = read(0, out, max_len - 1);
+    if (n <= 0) {
+        if (out && max_len > 0) {
+            out[0] = '\0';
+        }
         return 0;
     }
-    out[0] = '\0';
-
-    while (1) {
-        uint32_t key = sys_getkey();
-        if (key == 0) {
-            continue;
-        }
-        if (key == NOTE_KEY_UP) {
-            if (history_count > 0) {
-                if (history_view == -1) {
-                    strncpy(history_scratch, out, sizeof(history_scratch) - 1);
-                    history_scratch[sizeof(history_scratch) - 1] = '\0';
-                    history_saved = true;
-                    history_view = 0;
-                } else if (history_view < history_count - 1) {
-                    history_view++;
-                }
-                replace_input_line(out, &len, &cur, max_len, history_get(history_view), &last_len, prompt_offset);
-            }
-            continue;
-        }
-        if (key == NOTE_KEY_DOWN) {
-            if (history_view != -1) {
-                if (history_view > 0) {
-                    history_view--;
-                    replace_input_line(out, &len, &cur, max_len, history_get(history_view), &last_len, prompt_offset);
-                } else {
-                    history_view = -1;
-                    if (history_saved) {
-                        replace_input_line(out, &len, &cur, max_len, history_scratch, &last_len, prompt_offset);
-                    } else {
-                        replace_input_line(out, &len, &cur, max_len, "", &last_len, prompt_offset);
-                    }
-                    history_saved = false;
-                }
-            }
-            continue;
-        }
-        if (key == NOTE_KEY_LEFT) {
-            if (cur > 0) {
-                cur--;
-                sys_set_cursor_offset(prompt_offset + (uint32_t)(cur * 2));
-            }
-            continue;
-        }
-        if (key == NOTE_KEY_RIGHT) {
-            if (cur < len) {
-                cur++;
-                sys_set_cursor_offset(prompt_offset + (uint32_t)(cur * 2));
-            }
-            continue;
-        }
-        if (key == '\r' || key == '\n') {
-            sys_set_cursor_offset(prompt_offset + (uint32_t)(len * 2));
-            console_write("\n");
-            break;
-        }
-        if (key == '\b' || key == 0x7f) {
-            if (cur > 0) {
-                if (history_view != -1) {
-                    history_view = -1;
-                    history_saved = false;
-                }
-                memmove(&out[cur - 1], &out[cur], (size_t)(len - cur));
-                len--;
-                cur--;
-                out[len] = '\0';
-                redraw_line(out, len, cur, &last_len, prompt_offset);
-            }
-            continue;
-        }
-        if (key < 32 || key >= 127) {
-            continue;
-        }
-        if (len < max_len - 1) {
-            if (history_view != -1) {
-                history_view = -1;
-                history_saved = false;
-            }
-            memmove(&out[cur + 1], &out[cur], (size_t)(len - cur));
-            out[cur++] = (char)key;
-            len++;
-            out[len] = '\0';
-            if (cur == len && history_view == -1) {
-                console_write_char((char)key);
-                last_len = len;
-            } else {
-                redraw_line(out, len, cur, &last_len, prompt_offset);
-            }
-        }
+    out[n] = 0;
+    if (n > 0 && out[n - 1] == '\n') {
+        out[n - 1] = 0;
     }
-    out[len] = '\0';
-    history_push(out);
-    return len;
+    return n;
 }
 
 static int split_args(char* line, char** argv, int max_args) {
@@ -285,79 +63,703 @@ static int split_args(char* line, char** argv, int max_args) {
         if (argc >= max_args) {
             return -1;
         }
-        argv[argc++] = p;
-        while (*p && !is_space(*p)) {
-            p++;
-        }
-        if (*p) {
-            *p = '\0';
-            p++;
+        char* out = p;
+        argv[argc++] = out;
+
+        if (*p == '"' || *p == '\'') {
+            char q = *p++;
+            while (*p) {
+                if (*p == q) {
+                    p++;
+                    break;
+                }
+                if (*p == '\\' && p[1] != '\0') {
+                    p++;
+                }
+                *out++ = *p++;
+            }
+            *out = '\0';
+        } else {
+            while (*p && !is_space(*p)) {
+                if (*p == '\\' && p[1] != '\0') {
+                    p++;
+                }
+                *out++ = *p++;
+            }
+            if (*p) {
+                *p++ = '\0';
+            } else {
+                *out = '\0';
+            }
         }
     }
     return argc;
 }
 
-static void print_help(void) {
-    console_write("Builtins: help, exit, sh, clear, echo, reboot, fl, vf, cd, note, disk\n");
-    console_write("External: <path> [args...] or <cmd> (tries /cmd)\n");
+static bool is_builtin_name(const char* cmd) {
+    if (!cmd || !*cmd) {
+        return false;
+    }
+    return strcmp(cmd, "cd") == 0 || strcmp(cmd, "disk") == 0;
 }
 
-static void run_external(char* cmd, char** argv, int argc, bool background) {
+static bool is_drive_arg(const char* s) {
+    if (!s || !*s) {
+        return false;
+    }
+    if (strncmp(s, "/dev/", 5) == 0 && s[5] != '\0') {
+        return true;
+    }
+    int i = 0;
+    while (s[i] >= '0' && s[i] <= '9') {
+        i++;
+    }
+    if (i == 0) {
+        return false;
+    }
+    if (s[i] == '\0') {
+        return true;
+    }
+    if (s[i] == '#' && s[i + 1] == '\0') {
+        return true;
+    }
+    return false;
+}
+
+static bool dir_has_entry(const char* path, const char* name) {
+    enum { MAX_ENTRIES = 128, NAME_LEN = 48 };
+    char names[MAX_ENTRIES * NAME_LEN];
+    uint8_t is_dir[MAX_ENTRIES];
+    sys_dir_list_t req;
+
+    if (!name || !*name) {
+        return false;
+    }
+
+    memset(names, 0, sizeof(names));
+    memset(is_dir, 0, sizeof(is_dir));
+    req.path = path;
+    req.names = names;
+    req.is_dir = is_dir;
+    req.max_entries = MAX_ENTRIES;
+    req.name_len = NAME_LEN;
+
+    int count = sys_dir_list(&req);
+    if (count <= 0) {
+        return false;
+    }
+    if (count > MAX_ENTRIES) {
+        count = MAX_ENTRIES;
+    }
+    for (int i = 0; i < count; i++) {
+        const char* ent = &names[i * NAME_LEN];
+        if (ent[0] == '\0') {
+            continue;
+        }
+        if (strcasecmp(ent, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int find_unquoted_pipe(const char* s) {
+    if (!s) {
+        return -1;
+    }
+    char quote = '\0';
+    for (int i = 0; s[i]; i++) {
+        char c = s[i];
+        if (c == '\\' && s[i + 1]) {
+            i++;
+            continue;
+        }
+        if (quote) {
+            if (c == quote) {
+                quote = '\0';
+            }
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            quote = c;
+            continue;
+        }
+        if (c == '|') {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static char* trim_spaces_inplace(char* s) {
+    if (!s) {
+        return s;
+    }
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') {
+        s++;
+    }
+    int len = (int)strlen(s);
+    while (len > 0) {
+        char c = s[len - 1];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+            break;
+        }
+        s[len - 1] = '\0';
+        len--;
+    }
+    return s;
+}
+
+static int func_find(const char* name) {
+    if (!name || !*name) {
+        return -1;
+    }
+    for (int i = 0; i < MAX_FUNCS; i++) {
+        if (!g_funcs[i].used) {
+            continue;
+        }
+        if (strcmp(g_funcs[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool func_set(const char* name, const char* body) {
+    if (!name || !*name || !body || !*body) {
+        return false;
+    }
+
+    int idx = func_find(name);
+    if (idx < 0) {
+        for (int i = 0; i < MAX_FUNCS; i++) {
+            if (!g_funcs[i].used) {
+                idx = i;
+                g_funcs[i].used = true;
+                break;
+            }
+        }
+    }
+    if (idx < 0) {
+        return false;
+    }
+
+    strncpy(g_funcs[idx].name, name, sizeof(g_funcs[idx].name) - 1);
+    g_funcs[idx].name[sizeof(g_funcs[idx].name) - 1] = '\0';
+    strncpy(g_funcs[idx].body, body, sizeof(g_funcs[idx].body) - 1);
+    g_funcs[idx].body[sizeof(g_funcs[idx].body) - 1] = '\0';
+    return true;
+}
+
+static int try_define_function(char* line) {
+    if (!line) {
+        return 0;
+    }
+
+    char* s = trim_spaces_inplace(line);
+    if (!is_name_start(*s)) {
+        return 0;
+    }
+
+    char* p = s;
+    while (is_name_char(*p)) {
+        p++;
+    }
+    size_t name_len = (size_t)(p - s);
+    if (name_len == 0) {
+        return 0;
+    }
+    if (name_len >= MAX_FUNC_NAME) {
+        eprint("func: name too long\n");
+        return 1;
+    }
+
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '(') {
+        return 0;
+    }
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != ')') {
+        eprint("func: use name() { body }\n");
+        return 1;
+    }
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '{') {
+        eprint("func: missing '{'\n");
+        return 1;
+    }
+    p++;
+
+    char* end = s + strlen(s);
+    while (end > p && is_space(end[-1])) {
+        end--;
+    }
+    if (end <= p || end[-1] != '}') {
+        eprint("func: missing '}'\n");
+        return 1;
+    }
+    end--;
+    while (end > p && is_space(end[-1])) {
+        end--;
+    }
+
+    if (end <= p) {
+        eprint("func: empty body\n");
+        return 1;
+    }
+
+    char* body_start = p;
+    while (body_start < end && is_space(*body_start)) {
+        body_start++;
+    }
+
+    size_t body_len = (size_t)(end - body_start);
+    if (body_len == 0 || body_len >= MAX_FUNC_BODY) {
+        eprint("func: body too long\n");
+        return 1;
+    }
+
+    char name[MAX_FUNC_NAME];
+    char body[MAX_FUNC_BODY];
+    memcpy(name, s, name_len);
+    name[name_len] = '\0';
+    memcpy(body, body_start, body_len);
+    body[body_len] = '\0';
+
+    if (!func_set(name, body)) {
+        eprint("func: cannot store function\n");
+        return 1;
+    }
+    return 1;
+}
+
+static bool expand_function_segment(const char* seg, char* out, size_t out_sz) {
+    if (!seg || !out || out_sz == 0) {
+        return false;
+    }
+
+    const char* p = seg;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!is_name_start(*p)) {
+        return false;
+    }
+
+    const char* name_start = p;
+    while (is_name_char(*p)) p++;
+    size_t name_len = (size_t)(p - name_start);
+    if (name_len == 0 || name_len >= MAX_FUNC_NAME) {
+        return false;
+    }
+
+    char name[MAX_FUNC_NAME];
+    memcpy(name, name_start, name_len);
+    name[name_len] = '\0';
+
+    int idx = func_find(name);
+    if (idx < 0) {
+        return false;
+    }
+
+    char prefix[MAX_LINE];
+    size_t prefix_len = (size_t)(name_start - seg);
+    if (prefix_len >= sizeof(prefix)) {
+        return false;
+    }
+    memcpy(prefix, seg, prefix_len);
+    prefix[prefix_len] = '\0';
+
+    int n = snprintf(out, out_sz, "%s%s%s", prefix, g_funcs[idx].body, p);
+    return n > 0 && (size_t)n < out_sz;
+}
+
+static bool expand_functions_in_line(char* line) {
+    if (!line || !*line) {
+        return false;
+    }
+
+    bool changed = false;
+    char out[MAX_LINE];
+    size_t out_len = 0;
+    size_t i = 0;
+    size_t len = strlen(line);
+    char quote = '\0';
+
+    while (i <= len) {
+        size_t seg_start = i;
+        while (i < len) {
+            char c = line[i];
+            if (c == '\\' && i + 1 < len) {
+                i += 2;
+                continue;
+            }
+            if (quote) {
+                if (c == quote) quote = '\0';
+                i++;
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                quote = c;
+                i++;
+                continue;
+            }
+            if (c == '|') {
+                break;
+            }
+            i++;
+        }
+
+        size_t seg_end = i;
+        char seg[MAX_LINE];
+        size_t seg_len = seg_end - seg_start;
+        if (seg_len >= sizeof(seg)) {
+            return false;
+        }
+        memcpy(seg, line + seg_start, seg_len);
+        seg[seg_len] = '\0';
+
+        char expanded[MAX_LINE];
+        const char* use = seg;
+        if (expand_function_segment(seg, expanded, sizeof(expanded))) {
+            use = expanded;
+            changed = true;
+        }
+
+        size_t use_len = strlen(use);
+        if (out_len + use_len + 2 >= sizeof(out)) {
+            return false;
+        }
+        memcpy(out + out_len, use, use_len);
+        out_len += use_len;
+
+        if (i < len && line[i] == '|') {
+            out[out_len++] = '|';
+            i++;
+        } else {
+            break;
+        }
+    }
+
+    out[out_len] = '\0';
+    if (changed) {
+        strncpy(line, out, MAX_LINE - 1);
+        line[MAX_LINE - 1] = '\0';
+    }
+    return changed;
+}
+
+static int parse_redirections(char** argv, int argc, char** in_path, char** out_path, bool* out_append) {
+    int outc = 0;
+    *in_path = NULL;
+    *out_path = NULL;
+    *out_append = false;
+
+    for (int i = 0; i < argc; i++) {
+        char* tok = argv[i];
+        if (!tok || !*tok) {
+            continue;
+        }
+
+        if (strcmp(tok, "<") == 0 || strcmp(tok, ">") == 0) {
+            if (i + 1 >= argc) {
+                eprint("redir: missing file for %s\n", tok);
+                return -1;
+            }
+            char* path = argv[++i];
+            if (!path || !*path) {
+                eprint("redir: invalid file\n");
+                return -1;
+            }
+            if (tok[0] == '<') {
+                *in_path = path;
+            } else {
+                *out_path = path;
+                *out_append = false;
+            }
+            continue;
+        }
+
+        if (strcmp(tok, ">>") == 0) {
+            if (i + 1 >= argc) {
+                eprint("redir: missing file for >>\n");
+                return -1;
+            }
+            char* path = argv[++i];
+            if (!path || !*path) {
+                eprint("redir: invalid file\n");
+                return -1;
+            }
+            *out_path = path;
+            *out_append = true;
+            continue;
+        }
+
+        if (tok[0] == '<') {
+            if (!tok[1]) {
+                eprint("redir: missing file for <\n");
+                return -1;
+            }
+            *in_path = tok + 1;
+            continue;
+        }
+        if (tok[0] == '>') {
+            if (tok[1] == '>' && tok[2] != '\0') {
+                *out_path = tok + 2;
+                *out_append = true;
+                continue;
+            }
+            if (tok[1] == '>' && tok[2] == '\0') {
+                eprint("redir: missing file for >>\n");
+                return -1;
+            }
+            if (!tok[1]) {
+                eprint("redir: missing file for >\n");
+                return -1;
+            }
+            *out_path = tok + 1;
+            *out_append = false;
+            continue;
+        }
+
+        argv[outc++] = tok;
+    }
+
+    argv[outc] = NULL;
+    return outc;
+}
+
+static uint32_t launch_process(const char* path, char** argv, int argc,
+                               bool redirected,
+                               int stdin_fd, int stdout_fd, int stderr_fd)
+{
+    int fr = fork();
+    if (fr < 0) return 0;
+
+    if (fr == 0) {
+        char exec_path[128];
+        strncpy(exec_path, path, sizeof(exec_path)-1);
+        exec_path[sizeof(exec_path)-1] = 0;
+
+        // 🔥 argv 깊은 복사
+        char* new_argv[MAX_ARGS];
+        char arg_storage[512];
+        int off = 0;
+
+        for (int i = 0; i < argc; i++) {
+            size_t len = strlen(argv[i]) + 1;
+            if (off + len >= sizeof(arg_storage)) {
+                sys_exit(127);
+            }
+            memcpy(&arg_storage[off], argv[i], len);
+            new_argv[i] = &arg_storage[off];
+            off += len;
+        }
+        new_argv[argc] = NULL;
+
+        int rc = exec(exec_path,
+                        (const char* const*)new_argv,
+                        argc);
+
+        printf("%s: command not found\n", exec_path);
+        sys_exit(127);
+    }
+
+    return (uint32_t)fr;
+}
+
+static uint32_t spawn_external_pid(char* cmd, char** argv, int argc,
+                                   int stdin_fd, int stdout_fd, int stderr_fd,
+                                   bool force_external) {
+    bool redirected = (stdin_fd >= 0 || stdout_fd >= 0 || stderr_fd >= 0);
+    uint32_t pid = 0;
+
+    if (cmd[0] == '/' || strchr(cmd, '/')) {
+        return launch_process(cmd, argv, argc,
+                              redirected, stdin_fd, stdout_fd, stderr_fd);
+    }
+
+    if (!force_external && is_builtin_name(cmd)) {
+        return 0;
+    }
+
+    char fullpath[128];
+
+    snprintf(fullpath, sizeof(fullpath), "/cmd/%s", cmd);
+
+    if (dir_has_entry("/cmd", cmd)) {
+        pid = launch_process(fullpath, argv, argc,
+                             redirected, stdin_fd, stdout_fd, stderr_fd);
+        if ((int32_t)pid > 0) {
+            return pid;
+        }
+    }
+
+    // fallback
+    pid = launch_process(fullpath, argv, argc,
+                         redirected, stdin_fd, stdout_fd, stderr_fd);
+    if ((int32_t)pid > 0) {
+        return pid;
+    }
+
+    if (dir_has_entry(NULL, cmd)) {
+        return launch_process(cmd, argv, argc,
+                              redirected, stdin_fd, stdout_fd, stderr_fd);
+    }
+
+    return 0;
+}
+
+static void run_external(char* cmd, char** argv, int argc, bool background, int stdin_fd, int stdout_fd) {
     if (!cmd || !*cmd) {
         return;
     }
 
-    int pid = sys_fork();
-    if (pid < 0) {
-        console_write("fork failed\n");
-        return;
+    uint32_t pid = spawn_external_pid(cmd, argv, argc, stdin_fd, stdout_fd, -1, false);
+    if (stdin_fd >= 0) {
+        (void)close(stdin_fd);
+    }
+    if (stdout_fd >= 0) {
+        (void)close(stdout_fd);
     }
 
-    if (pid == 0) {
-        con_fd = -1;
-        char path[128];
-        if (cmd[0] == '/' || strchr(cmd, '/')) {
-            argv[0] = cmd;
-            int rc = sys_exec(cmd, (const char* const*)argv, argc);
-            if (rc == EXEC_ERR_NOENT) {
-                console_write("shell: ");
-                console_write(cmd);
-                console_write(" Command not found\n");
-            } else if (rc != 0) {
-                exec_error_message(rc);
-            }
-            sys_exit(1);
-        } else {
-            snprintf(path, sizeof(path), "/cmd/%s", cmd);
-            argv[0] = path;
-            int rc = sys_exec(path, (const char* const*)argv, argc);
-            if (rc != EXEC_ERR_NOENT && rc != 0) {
-                exec_error_message(rc);
-                sys_exit(1);
-            }
-        }
-
-        console_write("shell: ");
-        console_write(cmd);
-        console_write(" Command not found\n");
-        sys_exit(1);
+    if ((int32_t)pid <= 0) {
+        printf("%s: command not found\n", cmd);
+        return;
     }
 
     if (background) {
-        console_write("[bg] pid ");
-        console_write_u32((uint32_t)pid);
-        console_write("\n");
+        printf("[bg] pid %d\n", (int)pid);
         return;
     }
 
-    (void)sys_wait((uint32_t)pid);
+    uint32_t self_pid = getpid();
+    set_foreground(pid);
+
+    int status;
+    while ((status = wait(pid)) == SYS_WAIT_RUNNING) {
+        yield();   // 또는 짧은 sleep
+    }
+    
+    set_foreground(self_pid);
+
+    if (status == 127) {
+        printf("%s: command not found\n", cmd);
+    }
 }
 
 static void run_command(char* line) {
+    int def_rc = try_define_function(line);
+    if (def_rc != 0) {
+        return;
+    }
+
+    for (int pass = 0; pass < 4; pass++) {
+        if (!expand_functions_in_line(line)) {
+            break;
+        }
+    }
+
+    {
+        char* segs[MAX_PIPE_CMDS];
+        int segc = 0;
+        char* cur = line;
+
+        while (1) {
+            int pos = find_unquoted_pipe(cur);
+            if (pos < 0) {
+                break;
+            }
+            if (segc >= MAX_PIPE_CMDS - 1) {
+                eprint("pipe: too many stages\n");
+                return;
+            }
+            cur[pos] = '\0';
+            segs[segc++] = trim_spaces_inplace(cur);
+            cur = cur + pos + 1;
+        }
+        segs[segc++] = trim_spaces_inplace(cur);
+
+        if (segc > 1) {
+            char* argvv[MAX_PIPE_CMDS][MAX_ARGS];
+            int argcv[MAX_PIPE_CMDS];
+            uint32_t pids[MAX_PIPE_CMDS];
+            int pidc = 0;
+            int prev_read = -1;
+
+            for (int i = 0; i < segc; i++) {
+                if (!segs[i] || !segs[i][0]) {
+                    eprint("pipe: invalid syntax\n");
+                    if (prev_read >= 0) (void)close(prev_read);
+                    return;
+                }
+                argcv[i] = split_args(segs[i], argvv[i], MAX_ARGS);
+                if (argcv[i] <= 0) {
+                    eprint("pipe: invalid command\n");
+                    if (prev_read >= 0) (void)close(prev_read);
+                    return;
+                }
+                for (int j = 0; j < argcv[i]; j++) {
+                    if (strchr(argvv[i][j], '<') || strchr(argvv[i][j], '>')) {
+                        eprint("pipe: redirection with pipeline not supported\n");
+                        if (prev_read >= 0) (void)close(prev_read);
+                        return;
+                    }
+                }
+                if (strcmp(argvv[i][0], "cd") == 0) {
+                    eprint("pipe: cd in pipeline not supported\n");
+                    if (prev_read >= 0) (void)close(prev_read);
+                    return;
+                }
+
+                int next_pipe[2] = { -1, -1 };
+                int in_fd = prev_read;
+                int out_fd = -1;
+                if (i + 1 < segc) {
+                    if (!pipe(next_pipe)) {
+                        eprint("pipe: failed\n");
+                        if (in_fd >= 0) (void)close(in_fd);
+                        return;
+                    }
+                    out_fd = next_pipe[1];
+                }
+
+                uint32_t pid = spawn_external_pid(argvv[i][0], argvv[i], argcv[i],
+                                                  in_fd, out_fd, -1, true);
+                if (out_fd >= 0) (void)close(out_fd);
+                if (in_fd >= 0) (void)close(in_fd);
+
+                if ((int32_t)pid <= 0) {
+                    if (next_pipe[0] >= 0) (void)close(next_pipe[0]);
+                    for (int k = 0; k < pidc; k++) {
+                        (void)kill(pids[k], 1);
+                    }
+                    eprint("pipe: spawn failed\n");
+                    return;
+                }
+
+                pids[pidc++] = pid;
+                prev_read = (next_pipe[0] >= 0) ? next_pipe[0] : -1;
+            }
+
+            if (prev_read >= 0) {
+                (void)close(prev_read);
+            }
+
+            uint32_t self_pid = getpid();
+            (void)set_foreground(pids[pidc - 1]);
+            for (int i = 0; i < pidc; i++) {
+                (void)wait(pids[i]);
+            }
+            (void)set_foreground(self_pid);
+            return;
+        }
+    }
+
     char* argv[MAX_ARGS];
     int argc = split_args(line, argv, MAX_ARGS);
     if (argc < 0) {
-        console_write("too many arguments\n");
+        eprint("too many arguments\n");
         return;
     }
     if (argc == 0) {
@@ -365,7 +767,7 @@ static void run_command(char* line) {
     }
 
     bool background = false;
-    if (argc > 0 && strcmp(argv[argc - 1], "&") == 0) {
+    if (strcmp(argv[argc - 1], "&") == 0) {
         background = true;
         argv[argc - 1] = NULL;
         argc--;
@@ -374,93 +776,105 @@ static void run_command(char* line) {
         }
     }
 
-    if (strcmp(argv[0], "exit") == 0 || strcmp(argv[0], "sh") == 0) {
-        sys_exit(0);
-    }
-    if (strcmp(argv[0], "help") == 0) {
-        print_help();
+    char* in_path = NULL;
+    char* out_path = NULL;
+    bool out_append = false;
+    argc = parse_redirections(argv, argc, &in_path, &out_path, &out_append);
+    if (argc < 0) {
         return;
     }
-    if (strcmp(argv[0], "clear") == 0) {
-        sys_clear_screen();
-        return;
-    }
-    if (strcmp(argv[0], "reboot") == 0) {
-        sys_reboot();
-        return;
-    }
-    if (strcmp(argv[0], "echo") == 0) {
-        for (int i = 1; i < argc; i++) {
-            if (i > 1) {
-                console_write(" ");
-            }
-            console_write(argv[i]);
-        }
-        console_write("\n");
-        return;
-    }
-    if (strcmp(argv[0], "fl") == 0) {
-        if (argc > 2) {
-            console_write("Usage: fl [path]\n");
-            return;
-        }
-        const char* path = (argc == 2) ? argv[1] : NULL;
-        sys_ls(path);
-        return;
-    }
-    if (strcmp(argv[0], "vf") == 0) {
-        if (argc != 2) {
-            console_write("Usage: vf <file>\n");
-            return;
-        }
-        if (!sys_cat(argv[1])) {
-            console_write("vf: failed to read file\n");
-        }
-        return;
-    }
-    if (strcmp(argv[0], "cd") == 0) {
-        if (argc != 2) {
-            console_write("Usage: cd <path>\n");
-            return;
-        }
-        if (!sys_chdir(argv[1])) {
-            console_write("cd: failed to change directory\n");
-        }
-        return;
-    }
-    if (strcmp(argv[0], "note") == 0) {
-        if (argc != 2) {
-            console_write("Usage: note <file>\n");
-            return;
-        }
-        if (!sys_note(argv[1])) {
-            console_write("note: failed to open editor\n");
-        }
-        sys_clear_screen();
-        return;
-    }
-    if (strcmp(argv[0], "disk") == 0) {
-        if (argc == 1) {
-            sys_disk(NULL);
-            return;
-        }
-        if (argc == 2) {
-            sys_disk(argv[1]);
-            return;
-        }
-        console_write("Usage: disk [ls|<n>]\n");
+    if (argc == 0) {
+        eprint("redir: missing command\n");
         return;
     }
 
-    run_external(argv[0], argv, argc, background);
+    int stdin_fd = -1;
+    int stdout_fd = -1;
+    if (in_path) {
+        stdin_fd = open(in_path, 0);
+        if (stdin_fd < 0) {
+            eprint("redir: cannot open %s\n", in_path);
+            return;
+        }
+    }
+    if (out_path) {
+        uint32_t out_flags = SYS_OPEN_FLAG_CREATE;
+        if (out_append) {
+            out_flags |= SYS_OPEN_FLAG_APPEND;
+        }
+        stdout_fd = open(out_path, out_flags);
+        if (stdout_fd < 0) {
+            if (stdin_fd >= 0) {
+                (void)close(stdin_fd);
+            }
+            eprint("redir: cannot open %s\n", out_path);
+            return;
+        }
+    }
+
+    if (strcmp(argv[0], "cd") != 0 && strcmp(argv[0], "disk") != 0) {
+        run_external(argv[0], argv, argc, background, stdin_fd, stdout_fd);
+        return;
+    }
+
+    if (stdin_fd >= 0 || stdout_fd >= 0) {
+        if (stdin_fd >= 0) {
+            (void)close(stdin_fd);
+        }
+        if (stdout_fd >= 0) {
+            (void)close(stdout_fd);
+        }
+        eprint("builtin command does not support redirection\n");
+        return;
+    }
+
+    if (background) {
+        eprint("builtin command does not support background mode\n");
+        return;
+    }
+
+    if (strcmp(argv[0], "cd") == 0) {
+        if (argc != 2) {
+            eprint("Usage: cd <path>\n");
+            return;
+        }
+        if (!chdir(argv[1])) {
+            eprint("cd: failed to change directory\n");
+        }
+        return;
+    }
+
+    if (argc != 2) {
+        eprint("Usage: disk ls | disk <n> | disk /dev/<block>\n");
+        return;
+    }
+
+    char cmdline[32];
+    if (strcmp(argv[1], "ls") == 0) {
+        strcpy(cmdline, "disk ls");
+    } else {
+        if (!is_drive_arg(argv[1])) {
+            eprint("Usage: disk ls | disk <n> | disk /dev/<block>\n");
+            return;
+        }
+        strcpy(cmdline, "disk ");
+        strncat(cmdline, argv[1], sizeof(cmdline) - strlen(cmdline) - 1);
+        if (strncmp(argv[1], "/dev/", 5) != 0 && strchr(argv[1], '#') == NULL) {
+            strncat(cmdline, "#", sizeof(cmdline) - strlen(cmdline) - 1);
+        }
+    }
+
+    if (super_cmd(cmdline) <= 0) {
+        eprint("disk: command failed\n");
+    }
 }
 
 int main(void) {
     char line[MAX_LINE];
-    console_write("orion shell\n");
+    printf("orion shell\n");
 
     for (;;) {
-        print_prompt();
+        printf("%s", PROMPT);
         read_line(line, sizeof(line));
         run_command(line);
     }

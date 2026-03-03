@@ -1,6 +1,6 @@
 #include "pci.h"
 #include "hal.h"   // hal_in32/out 필요
-#include "../drivers/screen.h" // kprintf()
+#include "../kernel/io/console.h" // kprintf()
 #include "ac97.h"
 #include "hda.h"
 #include "ahci.h"

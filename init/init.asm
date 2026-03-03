@@ -1,40 +1,37 @@
 [BITS 32]
-ORG 0x500000
 global _start
 
 section .text
 _start:
-    mov eax, 16 ; start orion-sysmgr
+    jmp short .getbase
+.base:
+    pop ebp
+    jmp .realstart
+
+.getbase:
+    call .base
+
+.realstart:
+    mov eax, 19 ; start orion-sysmgr
     int 0xA5
 
-    mov eax, 1
-    int 0xA5
-
-    mov eax, 11
+    mov eax, 259 ; get boot flags
     int 0xA5
     test eax, 1
     jz .skip_clear
 
-    mov eax, 3
+    mov eax, 64 ; clear screen
     int 0xA5
 .skip_clear:
 
-    mov ebx, motd_path
-    mov eax, 17
-    int 0xA5
-
-    mov eax, 27
-    int 0xA5
-
-    mov ebx, shell_path
+    lea ebx, [ebp + shell_path - .base]
     xor ecx, ecx
     xor edx, edx
-    mov eax, 20
+    mov eax, 9
     int 0xA5
 
-    ;mov eax, 8  ;exit
-    ;int 0xA5
+.hang:
+    jmp .hang
 
 section .rodata
-motd_path db "/system/config/motd.txt", 0
-shell_path db "/cmd/shell.sys", 0
+shell_path db "/cmd/login", 0

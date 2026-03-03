@@ -3,7 +3,7 @@
 #include "fat32.h"
 #include "xvfs.h"
 #include "disk.h"
-#include "../drivers/screen.h"
+#include "../kernel/io/console.h"
 #include "../mm/mem.h"
 #include "../libc/string.h"
 

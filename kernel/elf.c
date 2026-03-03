@@ -2,7 +2,7 @@
 #include "../fs/fscmd.h"
 #include "../mm/mem.h"
 #include "../mm/paging.h"
-#include "../drivers/screen.h"
+#include "io/console.h"
 #include "../libc/string.h"
 
 #define EI_NIDENT 16

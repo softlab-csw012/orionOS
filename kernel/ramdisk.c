@@ -1,6 +1,6 @@
 #include "ramdisk.h"
 #include "../drivers/ramdisk.h"
-#include "../drivers/screen.h"
+#include "io/console.h"
 #include "../fs/fscmd.h"
 #include "../libc/string.h"
 #include "../mm/mem.h"

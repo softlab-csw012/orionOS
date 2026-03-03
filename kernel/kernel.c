@@ -3,6 +3,7 @@
 #include "proc/proc.h"
 #include "proc/sysmgr.h"
 #include "bootcmd.h"
+#include "config.h"
 #include "cmd.h"
 #include "log.h"
 #include "proc/timer_task.h"
@@ -10,12 +11,13 @@
 #include "multiboot.h"
 #include "ramdisk.h"
 #include "run.h"
+#include "devfs.h"
+#include "io/console.h"
 #include "../cpu/isr.h"
 #include "../cpu/idt.h"
 #include "../cpu/gdt.h"
 #include "../cpu/tss.h"
 #include "../cpu/ports.h"
-#include "../drivers/screen.h"
 #include "../drivers/font.h"
 #include "../drivers/keyboard.h"
 #include "../drivers/hal.h"
@@ -51,11 +53,8 @@ void prompt() {
     if (!prompt_enabled || script_running)
         return;
 
-    if (current_drive < 0) {
-        kprint("orion:#=> ");
-    } else {
-        kprintf("orion:%d#%s=> ", current_drive, current_path);
-    }
+    (void)current_drive;
+    kprintf("orion:%s=> ", current_path);
 
     // ★★★ 프롬프트 찍고 난 뒤 실제 시작 위치 저장 ★★★
     prompt_row = get_cursor_row();
@@ -82,12 +81,7 @@ int parse_escapes(const char* src, char* dst, int maxlen) {
 //====kernel_main====
 void kernel_main(uint32_t magic, uint32_t addr) {
     g_mb_info_addr = addr; 
-    /*
-    if (magic != 0x36D76289) {
-        kprint("Invalid multiboot2 magic number.\n"); // 오류 메시지 출력
-        asm volatile("hlt"); // 시스템 정지
-    }
-    */
+
     gdt_install();
     {
         uint32_t esp;
@@ -107,8 +101,6 @@ void kernel_main(uint32_t magic, uint32_t addr) {
     
     kprint("initializing PMM...\n");
     pmm_init(g_mb_info_addr);
-    // Keep the BIN load buffer out of PMM allocations (page tables ended up here)
-    pmm_reserve_region(BIN_LOAD_ADDR, BIN_LOAD_ADDR + BIN_MAX_SIZE);
 
     kprint("\n");
     paging_init();
@@ -118,6 +110,7 @@ void kernel_main(uint32_t magic, uint32_t addr) {
     kmalloc_init(0, 0);
     kprint("\n");
 
+    devfs_init();
     parse_multiboot2((void*)addr);
     init_font();
     proc_init();
@@ -126,26 +119,26 @@ void kernel_main(uint32_t magic, uint32_t addr) {
 
     set_color(15, 0);
     enable_cursor(14, 15);
+    irq_set_ready(1);
+    irq_enable();
 
     kprint("\n");
     pci_scan_all_devices();
     kprint("\n");
     
     ata_init_all();
+    devfs_refresh_block_nodes();
     detect_disks_quick();
     cmd_disk_ls();
     kprint("\n");
-
-    if (ramdisk_mod_present) {
-        ramdisk_load_from_module(ramdisk_mod_start, ramdisk_mod_end, ramdisk_mod_cmdline);
-    }
-    m_disk("7");
     
+    parse_bootcmd();
+
+    orion_config_load();
+
     mouse_init();
     kprint("Ready to run init.sys.\n");
     start_init();
-    
-    sysmgr_request_prompt();
     
     sysmgr_idle_loop();
 }

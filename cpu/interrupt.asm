@@ -3,12 +3,32 @@
 [extern irq_handler]
 [extern sched_next_esp]
 
+global switch_to
+
+; switch_to:
+; - eax = next_esp (registers_t-compatible frame)
+; - never returns
+; - interrupt/syscall return is always iretd
+switch_to:
+    mov esp, eax
+
+    pop ebx                ; restore old ds
+    mov ds, bx
+    mov es, bx
+    mov fs, bx
+    mov gs, bx
+
+    popa
+    add esp, 8             ; drop error code + int number
+    iretd
+
 ; Common ISR code
 isr_common_stub:
     cli
 
     pusha                  ; save all gp registers
 
+    xor eax, eax
     mov ax, ds
     push eax               ; save old ds
 
@@ -27,55 +47,66 @@ isr_common_stub:
     mov eax, [sched_next_esp]
     test eax, eax
     jz .no_sched_switch
+    cmp eax, 0x00001000
+    jb .drop_sched_switch
+    test eax, 0x3
+    jnz .drop_sched_switch
     mov dword [sched_next_esp], 0
-    mov esp, eax
+    jmp switch_to
+.drop_sched_switch:
+    mov dword [sched_next_esp], 0
+
 .no_sched_switch:
-
-    pop ebx                ; restore old ds
-    mov ds, bx
-    mov es, bx
-    mov fs, bx
-    mov gs, bx
-
-    popa
-
-    add esp, 8             ; pop error code + int number
-
-    sti
-    iret
+    mov eax, esp
+    jmp switch_to
 
 ; Common IRQ code. Identical to ISR code except for the 'call' 
 ; and the 'pop ebx'
 irq_common_stub:
     cli
     pusha
+
+    xor eax, eax
     mov ax, ds
     push eax
-    mov ax, 0x10
+
+    mov ax, 0x10          ; KERNEL_DS
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
-    push esp
+
+    push esp              ; registers_t* 전달
     cld
     call irq_handler
-    add esp,4
+    add esp, 4
+
+    ; -------------------------------
+    ; 실제 컨텍스트 스위치 처리
+    ; -------------------------------
 
     mov eax, [sched_next_esp]
     test eax, eax
-    jz .no_irq_sched_switch
-    mov dword [sched_next_esp], 0
-    mov esp, eax
-.no_irq_sched_switch:
+    jz .no_sched_switch
 
-    pop eax
+    mov esp, eax          ; ★ 핵심: 새 프로세스 스택으로 교체
+    mov dword [sched_next_esp], 0
+
+.no_sched_switch:
+    ; -------------------------------
+    ; registers_t 기반 복원
+    ; -------------------------------
+
+    pop eax               ; ds 백업 복원
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
+
     popa
-    add esp, 8
-    iret
+
+    add esp, 8            ; int_no + err_code 제거
+    iretd
 	
 ; We don't get information about which interrupt was caller
 ; when the handler is run, so we will need to have a different handler

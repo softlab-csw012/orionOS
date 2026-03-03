@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdbool.h>
+#include "../kernel/io/console.h"
 #include "../drivers/screen.h"
 #include "../drivers/keyboard.h"
 #include "../libc/string.h"
@@ -177,6 +178,7 @@ static void draw_buffer(void) {
 
 /* ─────────────── note 메인 ─────────────── */
 void note(const char* fname) {
+    bool prev_keyboard_input_enabled = keyboard_input_enabled;
     keyboard_input_enabled = false;
     keyboard_note_debounce();
     disable_cursor();
@@ -341,6 +343,6 @@ void note(const char* fname) {
         kfree(buf[i]);
     kfree(buf);
 
-    keyboard_input_enabled = true;
+    keyboard_input_enabled = prev_keyboard_input_enabled;
     enable_cursor(14, 15);
 }

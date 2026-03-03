@@ -1,6 +1,6 @@
 // mm/pmm.c
 #include "pmm.h"
-#include "../drivers/screen.h"
+#include "../kernel/io/console.h"
 #include "../kernel/multiboot.h"
 #include "../libc/string.h"
 

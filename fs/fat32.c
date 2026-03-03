@@ -1,7 +1,7 @@
 #include "fat32.h"
 #include "fscmd.h"
-#include "../drivers/ata.h"
-#include "../drivers/screen.h"
+#include "../drivers/blockdev.h"
+#include "../kernel/io/console.h"
 #include "../kernel/cmd.h"
 #include "../kernel/kernel.h"
 #include "../libc/string.h"   // strcmp 등
@@ -66,11 +66,11 @@ static int fat32_strcasecmp(const char* a, const char* b);
 static void fat32_make83(const char* filename, char out[12]);
 
 static bool read_sector(uint8_t drive, uint32_t lba, uint8_t* buf) {
-    return ata_read(drive, lba, 1, buf);
+    return blockdev_read(drive, lba, 1, buf);
 }
 
 static void write_sector(uint8_t drive, uint32_t lba, const uint8_t* buf) {
-    ata_write(drive, lba, 1, buf);
+    blockdev_write(drive, lba, 1, buf);
 }
 
 static uint32_t cluster_to_lba(uint32_t cluster) {
@@ -133,7 +133,7 @@ static uint32_t fat32_alloc_cluster(uint8_t drive) {
                     uint32_t sectors_left = bpb.SecPerClus;
                     while (sectors_left > 0) {
                         uint16_t chunk = (sectors_left > 16) ? 16 : (uint16_t)sectors_left;
-                        ata_write(drive, base_lba, chunk, fat32_zero_chunk);
+                        blockdev_write(drive, base_lba, chunk, fat32_zero_chunk);
                         base_lba += chunk;
                         sectors_left -= chunk;
                     }
@@ -949,11 +949,14 @@ void fat32_ls(const char* path) {
     // 기본: 현재 디렉토리
     if (!path || path[0] == '\0') {
         cluster = current_dir_cluster32;
+        if (cluster < 2 || cluster >= 0x0FFFFFF8) {
+            cluster = root_dir_cluster32;
+        }
     }
     else {
         cluster = fat32_resolve_dir(path);
         if (cluster < 2 || cluster >= 0x0FFFFFF8) {
-            kprint("fl: invalid path\n");
+            kprint("dir: invalid path\n");
             return;
         }
     }
@@ -1066,7 +1069,7 @@ uint32_t fat32_get_fat_entry(uint32_t cluster) {
     uint32_t ent_offset = fat_offset % bytes_per_sector;
 
     uint8_t sector[512];
-    ata_read(fat32_drive, sector_num, 1, sector);
+    blockdev_read(fat32_drive, sector_num, 1, sector);
 
     uint32_t value = *(uint32_t*)(sector + ent_offset);
     value &= 0x0FFFFFFF;  // 상위 4비트는 예약됨 (28비트만 유효)
@@ -1127,7 +1130,7 @@ bool fat32_read_file_range(FAT32_DirEntry* entry, uint32_t offset, uint8_t* out_
 
         // 클러스터 전체 읽기
         for (uint32_t s = 0; s < bpb.SecPerClus; s++)
-            ata_read(fat32_drive, lba + s, 1, temp + s * bpb.BytsPerSec);
+            blockdev_read(fat32_drive, lba + s, 1, temp + s * bpb.BytsPerSec);
 
         uint32_t copy_start = skip_bytes;
         uint32_t to_copy = cluster_size - copy_start;
@@ -1147,7 +1150,7 @@ bool fat32_read_file_range(FAT32_DirEntry* entry, uint32_t offset, uint8_t* out_
 
 void fat32_cat(const char* fullpath) {
     if (!fullpath || fullpath[0] == '\0') {
-        kprint("cat: missing filename\n");
+        kprint("view: missing filename\n");
         return;
     }
 
@@ -1156,24 +1159,24 @@ void fat32_cat(const char* fullpath) {
     fat32_split_path(fullpath, dir, sizeof(dir), name, sizeof(name));
 
     if (name[0] == '\0') {
-        kprintf("cat: invalid path: %s\n", fullpath);
+        kprintf("view: invalid path: %s\n", fullpath);
         return;
     }
 
     uint32_t dir_cluster = fat32_resolve_dir(dir);
     if (dir_cluster < 2 || dir_cluster >= 0x0FFFFFF8) {
-        kprintf("cat: invalid path: %s\n", fullpath);
+        kprintf("view: invalid path: %s\n", fullpath);
         return;
     }
 
     FAT32_DirEntry entry;
     if (!fat32_find_entry_in_dir(dir_cluster, name, &entry)) {
-        kprintf("cat: file not found: %s\n", fullpath);
+        kprintf("view: file not found: %s\n", fullpath);
         return;
     }
 
     if (entry.Attr & 0x10) {
-        kprintf("cat: %s is a directory\n", fullpath);
+        kprintf("view: %s is a directory\n", fullpath);
         return;
     }
 
@@ -1184,7 +1187,7 @@ void fat32_cat(const char* fullpath) {
         return;
     }
     if (file_cluster < 2) {
-        kprintf("cat: invalid file cluster: %s\n", fullpath);
+        kprintf("view: invalid file cluster: %s\n", fullpath);
         return;
     }
 
@@ -1346,7 +1349,7 @@ bool fat32_write_file(const char* fullpath, const uint8_t* data, uint32_t size) 
         uint32_t tail_bytes = tocpy % SECTOR_SIZE;
 
         if (full_sectors > 0) {
-            ata_write(fat32_drive, lba, (uint16_t)full_sectors, src);
+            blockdev_write(fat32_drive, lba, (uint16_t)full_sectors, src);
             src += full_sectors * SECTOR_SIZE;
             remaining -= full_sectors * SECTOR_SIZE;
         }
@@ -1355,7 +1358,7 @@ bool fat32_write_file(const char* fullpath, const uint8_t* data, uint32_t size) 
             uint8_t tmp[SECTOR_SIZE];
             memset(tmp, 0, SECTOR_SIZE);
             memcpy(tmp, src, tail_bytes);
-            ata_write(fat32_drive, lba + full_sectors, 1, tmp);
+            blockdev_write(fat32_drive, lba + full_sectors, 1, tmp);
             src += tail_bytes;
             remaining -= tail_bytes;
         }
@@ -2112,7 +2115,7 @@ uint32_t fat32_free_clusters() {
 
     // FAT 섹터 반복
     for (uint32_t s = 0; s < bpb.FATSz32; s++) {
-        if (!ata_read(fat32_drive, fat_start + s, 1, sector))
+        if (!blockdev_read(fat32_drive, fat_start + s, 1, sector))
             continue;
 
         for (uint32_t i = 0; i < 512; i += 4) {
@@ -2207,7 +2210,7 @@ bool fat32_format_at(uint8_t drive, uint32_t base_lba, uint32_t total_sectors, c
     memcpy(sector + 90, bootcode_stub, sizeof(bootcode_stub));
     sector[510] = 0x55;
     sector[511] = 0xAA;
-    ata_write_sector(drive, base_lba + 0, sector);
+    blockdev_write_sector(drive, base_lba + 0, sector);
 
     /* ────────────────
        FSInfo 섹터 작성
@@ -2220,12 +2223,12 @@ bool fat32_format_at(uint8_t drive, uint32_t base_lba, uint32_t total_sectors, c
     *(uint32_t*)(sector + 508) = 0xAA550000; // Trail signature
     sector[510] = 0x55;
     sector[511] = 0xAA;
-    ata_write_sector(drive, base_lba + 1, sector);
+    blockdev_write_sector(drive, base_lba + 1, sector);
 
     /* ────────────────
        백업 부트섹터 작성 (LBA 6)
     ──────────────── */
-    ata_write_sector(drive, base_lba + 6, (uint8_t*)&bpb);
+    blockdev_write_sector(drive, base_lba + 6, (uint8_t*)&bpb);
 
     /* ────────────────
        FAT 초기화
@@ -2243,7 +2246,7 @@ bool fat32_format_at(uint8_t drive, uint32_t base_lba, uint32_t total_sectors, c
     uint32_t fat_start = base_lba + bpb.RsvdSecCnt;
     for (uint8_t f = 0; f < bpb.NumFATs; f++) {
         for (uint32_t i = 0; i < bpb.FATSz32; i++) {
-            ata_write_sector(drive, fat_start + f * bpb.FATSz32 + i, sector);
+            blockdev_write_sector(drive, fat_start + f * bpb.FATSz32 + i, sector);
             memset(sector, 0, 512);
         }
     }
@@ -2257,7 +2260,7 @@ bool fat32_format_at(uint8_t drive, uint32_t base_lba, uint32_t total_sectors, c
 
     uint32_t data_start = bpb.RsvdSecCnt + bpb.NumFATs * bpb.FATSz32;
     uint32_t root_lba = base_lba + data_start + (bpb.SecPerClus * (bpb.RootClus - 2));
-    ata_write_sector(drive, root_lba, sector);
+    blockdev_write_sector(drive, root_lba, sector);
 
     kprintf("[FAT32] Format complete.\n");
     kprintf("[FAT32] FAT size %u sectors, root cluster at %u (LBA %u)\n",
@@ -2266,6 +2269,6 @@ bool fat32_format_at(uint8_t drive, uint32_t base_lba, uint32_t total_sectors, c
 }
 
 bool fat32_format(uint8_t drive, const char* label) {
-    uint32_t total_sectors = ata_get_sector_count(drive);
+    uint32_t total_sectors = blockdev_get_sector_count(drive);
     return fat32_format_at(drive, 0, total_sectors, label);
 }

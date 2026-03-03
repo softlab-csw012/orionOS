@@ -1,10 +1,8 @@
 #include "screen.h"
 #include "hal.h"
 #include "../mm/mem.h"
-#include "../kernel/log.h"
 #include "../libc/string.h"
 #include "font.h"
-#include <stdarg.h>
 #include <stdint.h>
 
 #ifndef FB_SCROLL_USE_MEMMOVE
@@ -84,94 +82,6 @@ static uint32_t cursor_blink_ticks = 0;
  * If col, row, are negative, we will use the current offset
  */
 
-void print_dec(uint32_t num) {
-    char buf[16];   // 32bit 최대 4294967295 → 10자리 + 널문자
-    int i = 0;
-
-    if (num == 0) {
-        kprint("0");
-        return;
-    }
-
-    while (num > 0) {
-        buf[i++] = '0' + (num % 10);
-        num /= 10;
-    }
-
-    // 거꾸로 출력
-    for (int j = i - 1; j >= 0; j--) {
-        char s[2] = { buf[j], 0 };
-        kprint(s);
-    }
-}
-
-void kprint_at(const char *message, int col, int row) {
-    if (!message) {
-        kprint("kprint_at: NULL message!\n");
-        return;
-    }
-
-    int offset;
-    if (col >= 0 && row >= 0)
-        offset = get_offset(col, row);
-    else {
-        offset = get_cursor_offset();
-        row = get_offset_row(offset);
-        col = get_offset_col(offset);
-    }
-
-    int i = 0;
-    while (message[i] != 0) {
-        offset = print_char(message[i++], col, row, 0);
-        row = get_offset_row(offset);
-        col = get_offset_col(offset);
-    }
-}
-
-void kprint(const char *message) {
-    bootlog_add(message);
-    kprint_at(message, -1, -1);
-}
-
-void kprint_float(double value) {
-    // 음수 처리
-    if (value < 0) {
-        putchar('-');
-        value = -value;
-    }
-
-    int int_part = (int)value;
-    double frac = value - int_part;
-
-    // 정수면 그대로 출력
-    if (frac < 0.000001) {
-        kprint_int(int_part);
-        return;
-    }
-
-    // 소수점 이하 계산 (최대 6자리)
-    int frac_int = (int)(frac * 1000000 + 0.5);
-    char buf[16];
-    int len = 0;
-
-    // 뒤쪽 0 제거
-    while (frac_int > 0) {
-        buf[len++] = '0' + (frac_int % 10);
-        frac_int /= 10;
-    }
-    while (len > 0 && buf[len - 1] == '0') len--;
-
-    if (len == 0) {
-        kprint_int(int_part);
-        kprint(".0");
-        return;
-    }
-
-    kprint_int(int_part);
-    putchar('.');
-    for (int i = len - 1; i >= 0; i--) putchar(buf[i]);
-}
-
 void kprint_backspace(void) {
     int cur = get_cursor_offset();
     if (cur <= input_start_offset) {
@@ -190,102 +100,6 @@ void kprint_backspace(void) {
     set_cursor_offset(prev);
 }
 
-void print_hex(uint32_t num) {
-    char str[11] = "0x00000000";
-    const char* hex = "0123456789ABCDEF";
-
-    for (int i = 9; i >= 2; i--) {
-        str[i] = hex[num & 0xF];
-        num >>= 4;
-    }
-    kprint(str);
-}
-
-void print_hex_pad(uint32_t val, int width) {
-    char hex[16];
-    itoa(val, hex, 16); // 너네 libc/string.h 에 있는 itoa 쓰면 됨
-    int len = strlen(hex);
-    for (int i = 0; i < width - len; i++)
-        kprint("0");     // 앞에 0 채움
-    kprint(hex);
-}
-
-void print_byte(uint8_t val) {
-    const char* hex = "0123456789ABCDEF";
-    char out[3];
-    out[0] = hex[(val >> 4) & 0xF];
-    out[1] = hex[val & 0xF];
-    out[2] = '\0';
-    kprint(out);
-}
-
-void print_offset(uint32_t val) {
-    if (val < 0x1000) kprint("0");
-    if (val < 0x100)  kprint("0");
-    if (val < 0x10)   kprint("0");
-    print_hex(val);   // 기존 print_hex는 1개 인자만 받는다고 했으니 그대로 사용
-}
-
-int int_to_str(int value, char *buf) {
-    char tmp[16];
-    int i = 0, neg = 0;
-
-    if (value < 0) {
-        neg = 1;
-        value = -value;
-    }
-
-    do {
-        tmp[i++] = '0' + (value % 10);
-        value /= 10;
-    } while (value > 0);
-
-    int len = 0;
-    if (neg) buf[len++] = '-';
-    while (i--) buf[len++] = tmp[i];
-    buf[len] = '\0';
-    return len;
-}
-
-int uint_to_str(uint32_t value, char *buf) {
-    char tmp[16];
-    int i = 0;
-
-    do {
-        tmp[i++] = '0' + (value % 10);
-        value /= 10;
-    } while (value > 0);
-
-    int len = 0;
-    while (i--) buf[len++] = tmp[i];
-    buf[len] = '\0';
-    return len;
-}
-
-int hex_to_str(uint32_t value, char *buf, bool upper) {
-    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-    char tmp[16];
-    int i = 0;
-
-    do {
-        tmp[i++] = digits[value & 0xF];
-        value >>= 4;
-    } while (value > 0);
-
-    int len = 0;
-    buf[len++] = '0';
-    buf[len++] = 'x';
-    while (i--) buf[len++] = tmp[i];
-    buf[len] = '\0';
-    return len;
-}
-
-void kprint_int(uint32_t num) {
-    char buf[12];
-    int_to_str(num, buf);
-    kprint(buf);
-}
-
 uint8_t vga_attr(uint8_t fg, uint8_t bg) {
     return (bg << 4) | (fg & 0x0F);
 }
@@ -293,28 +107,6 @@ uint8_t vga_attr(uint8_t fg, uint8_t bg) {
 void set_color(uint8_t fg, uint8_t bg) {
     g_text_fg = fg;
     g_text_bg = bg;
-}
-
-int putchar(int c) {
-    uint8_t attr = vga_attr(g_text_fg, g_text_bg);
-
-    print_char((char)c, -1, -1, attr);
-    return (uint8_t)c;
-}
-
-int putchar_color(uint8_t ch, uint8_t fg, uint8_t bg) {
-    uint8_t attr = vga_attr(fg, bg);
-    print_char((char)ch, -1, -1, attr);
-    return ch;
-}
-
-void kprint_color(const char* message, uint8_t fg, uint8_t bg) {
-    bootlog_add(message);
-    uint8_t attr = vga_attr(fg, bg);
-
-    for (int i = 0; message[i] != 0; i++) {
-        print_char(message[i], -1, -1, attr);
-    }
 }
 
 uint8_t color_current() {
@@ -405,6 +197,46 @@ void screen_fb_fill_rect(int x, int y, int w, int h, uint32_t color) {
     }
 }
 
+void screen_fb_blit(int x, int y, int w, int h, const uint32_t* src, uint32_t src_pitch_bytes) {
+    if (!fb_write_ready() || !src)
+        return;
+    if (w <= 0 || h <= 0)
+        return;
+    if (src_pitch_bytes < (uint32_t)w * sizeof(uint32_t))
+        return;
+    if (x < 0 || y < 0)
+        return;
+
+    int max_w = (int)g_fb.width;
+    int max_h = (int)g_fb.height;
+    if (x >= max_w || y >= max_h)
+        return;
+    if (x + w > max_w || y + h > max_h)
+        return;
+
+    uint32_t row_bytes = (uint32_t)w * sizeof(uint32_t);
+    if (g_fb.bytes_per_pixel == 4) {
+        for (int row = 0; row < h; row++) {
+            const uint8_t* src_row = (const uint8_t*)src + (uint32_t)row * src_pitch_bytes;
+            uint8_t* dst = g_fb.addr + (uint32_t)(y + row) * g_fb.pitch +
+                           (uint32_t)x * g_fb.bytes_per_pixel;
+            memcpy(dst, src_row, row_bytes);
+        }
+        return;
+    }
+
+    for (int row = 0; row < h; row++) {
+        const uint8_t* src_row = (const uint8_t*)src + (uint32_t)row * src_pitch_bytes;
+        uint8_t* dst = g_fb.addr + (uint32_t)(y + row) * g_fb.pitch +
+                       (uint32_t)x * g_fb.bytes_per_pixel;
+        const uint32_t* sp = (const uint32_t*)src_row;
+        for (int col = 0; col < w; col++) {
+            fb_write_color(dst, sp[col]);
+            dst += g_fb.bytes_per_pixel;
+        }
+    }
+}
+
 static void fb_draw_glyph_px(int x, int y, uint8_t ch, uint32_t fg, uint32_t bg, bool transparent) {
     if (!fb_write_ready())
         return;
@@ -440,6 +272,59 @@ static void fb_draw_glyph_px(int x, int y, uint8_t ch, uint32_t fg, uint32_t bg,
                 fb_write_color(dst, bg);
             }
         }
+    }
+}
+
+void screen_buf_draw_text(uint32_t* dst, int dst_w, int dst_h, uint32_t dst_pitch_bytes,
+                          int x, int y, const char* text, uint32_t fg, uint32_t bg, bool transparent) {
+    if (!dst || !text || dst_w <= 0 || dst_h <= 0)
+        return;
+    if (dst_pitch_bytes < (uint32_t)dst_w * sizeof(uint32_t))
+        return;
+
+    uint8_t font_w = font_get_width();
+    uint8_t font_h = font_get_height();
+    uint8_t row_bytes = font_get_row_bytes();
+    if (!font_w || !font_h || !row_bytes)
+        return;
+
+    int start_x = x;
+    int cx = x;
+    int cy = y;
+    for (const char* p = text; *p; p++) {
+        char ch = *p;
+        if (ch == '\n') {
+            cy += font_h;
+            cx = start_x;
+            continue;
+        }
+        if (ch == '\r') {
+            cx = start_x;
+            continue;
+        }
+        if (ch == '\t') {
+            cx += (int)font_w * 4;
+            continue;
+        }
+
+        const uint8_t* glyph = font_get_glyph((uint8_t)ch);
+        for (uint8_t gy = 0; gy < font_h; gy++) {
+            int py = cy + (int)gy;
+            if (py < 0 || py >= dst_h)
+                continue;
+            const uint8_t* row_ptr = glyph + (size_t)gy * row_bytes;
+            uint32_t* out_row = (uint32_t*)((uint8_t*)dst + (uint32_t)py * dst_pitch_bytes);
+            for (uint8_t gx = 0; gx < font_w; gx++) {
+                int px = cx + (int)gx;
+                if (px < 0 || px >= dst_w)
+                    continue;
+                uint8_t byte = row_ptr[gx >> 3];
+                uint8_t bit = (uint8_t)(0x80u >> (gx & 7));
+                if (byte & bit) out_row[px] = fg;
+                else if (!transparent) out_row[px] = bg;
+            }
+        }
+        cx += font_w;
     }
 }
 
@@ -692,218 +577,6 @@ static void screen_draw_cell(int col, int row, uint16_t cell) {
     } else {
         vga_putc(col, row, (char)(cell & 0xff), (uint8_t)(cell >> 8));
     }
-}
-
-void kprint_char(char c) {
-    print_char(c, -1, -1, 0);  // 현재 커서에 문자 출력 (색상 0 = 기본)
-}
-
-void print_uint(uint32_t val) {
-    char buf[16];
-    int i = 0;
-    if (val == 0) {
-        putchar('0');
-        return;
-    }
-    while (val > 0) {
-        buf[i++] = '0' + (val % 10);
-        val /= 10;
-    }
-    while (i--) {
-        putchar(buf[i]);
-    }
-}
-
-static void put_str(const char* s) {
-    while (*s) putchar(*s++);
-}
-
-static void print_uint_padded(uint32_t val, int width, char pad) {
-    char buf[16];
-    int i = 0;
-
-    // 숫자 → 문자열 (역순)
-    if (val == 0) {
-        buf[i++] = '0';
-    } else {
-        while (val > 0 && i < (int)sizeof(buf)) {
-            buf[i++] = '0' + (val % 10);
-            val /= 10;
-        }
-    }
-
-    int len = i;
-
-    // padding 채우기 (width > len일 경우)
-    for (int j = len; j < width; j++) {
-        putchar(pad);
-    }
-
-    // 실제 숫자 출력 (뒤집어서)
-    for (int j = i - 1; j >= 0; j--) {
-        putchar(buf[j]);
-    }
-}
-
-static void print_int_padded(int val, int width, char pad) {
-    if (val < 0) {
-        putchar('-');
-        print_uint_padded((uint32_t)(-val), width - 1, pad);
-    } else {
-        print_uint_padded((uint32_t)val, width, pad);
-    }
-}
-
-static void print_hex_padded(uint32_t val, int width, char pad) {
-    char buf[16];
-    int i = 0;
-
-    if (val == 0) buf[i++] = '0';
-    else {
-        while (val > 0 && i < (int)sizeof(buf)) {
-            int nib = val & 0xF;
-            buf[i++] = (nib < 10) ? ('0' + nib) : ('A' + (nib - 10));
-            val >>= 4;
-        }
-    }
-
-    while (i < width) buf[i++] = pad;
-
-    putchar('0');
-    putchar('x');
-    for (int j = i - 1; j >= 0; j--)
-        putchar(buf[j]);
-}
-
-void print_HEX_padded(uint32_t val, int width, char pad) {
-    char buf[16];
-    int i = 0;
-    do {
-        int digit = val & 0xF;
-        buf[i++] = (digit < 10) ? ('0' + digit) : ('A' + (digit - 10));
-        val >>= 4;
-    } while (val);
-
-    while (i < width) buf[i++] = pad;
-
-    for (int j = i - 1; j >= 0; j--)
-        putchar(buf[j]);
-}
-
-void kprintf(const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-
-    char buffer[512];
-    int buf_i = 0;
-
-    for (const char* p = fmt; *p; p++) {
-        if (*p != '%') {
-            putchar(*p);
-            if (buf_i < (int)sizeof(buffer) - 1)
-                buffer[buf_i++] = *p;
-            continue;
-        }
-
-        // % 시작 → 포맷 파싱
-        p++;
-        char pad = ' ';
-        int width = 0;
-
-        if (*p == '0') { // zero-padding
-            pad = '0';
-            p++;
-        }
-
-        while (*p >= '0' && *p <= '9') { // width 읽기
-            width = width * 10 + (*p - '0');
-            p++;
-        }
-
-        switch (*p) {
-        case 's': {
-            char* str = va_arg(args, char*);
-            put_str(str);
-            while (*str && buf_i < (int)sizeof(buffer) - 1)
-                buffer[buf_i++] = *str++;
-            break;
-        }
-        case 'd': {
-            int val = va_arg(args, int);
-            print_int_padded(val, width, pad);
-            // 로그용 숫자 버퍼
-            char tmp[16]; 
-            int len = int_to_str(val, tmp);  // int→문자열 함수 필요
-            for (int i = 0; i < len && buf_i < (int)sizeof(buffer) - 1; i++)
-                buffer[buf_i++] = tmp[i];
-            break;
-        }
-        case 'u': {
-            uint32_t val = va_arg(args, uint32_t);
-            print_uint_padded(val, width, pad);
-            char tmp[16];
-            int len = uint_to_str(val, tmp);
-            for (int i = 0; i < len && buf_i < (int)sizeof(buffer) - 1; i++)
-                buffer[buf_i++] = tmp[i];
-            break;
-        }
-        case 'x': {
-            uint32_t val = va_arg(args, uint32_t);
-            print_hex_padded(val, width, pad);
-            // 로그엔 "0x..." 형태 추가
-            char tmp[16];
-            int len = hex_to_str(val, tmp, false);
-            for (int i = 0; i < len && buf_i < (int)sizeof(buffer) - 1; i++)
-                buffer[buf_i++] = tmp[i];
-            break;
-        }
-        case 'X': {
-            uint32_t val = va_arg(args, uint32_t);
-            print_HEX_padded(val, width, pad);
-            char tmp[16];
-            int len = hex_to_str(val, tmp, true);
-            for (int i = 0; i < len && buf_i < (int)sizeof(buffer) - 1; i++)
-                buffer[buf_i++] = tmp[i];
-            break;
-        }
-        case 'c': {
-            char c = (char)va_arg(args, int);
-            putchar(c);
-            if (buf_i < (int)sizeof(buffer) - 1)
-                buffer[buf_i++] = c;
-            break;
-        }
-        case 'p': {
-            uintptr_t ptr = (uintptr_t)va_arg(args, void*);
-            uint32_t val = (uint32_t)ptr;
-            print_hex_padded(val, width ? width : 8, '0'); // formatted as 32-bit address
-            char tmp[16];
-            int len = hex_to_str(val, tmp, false);
-            for (int i = 0; i < len && buf_i < (int)sizeof(buffer) - 1; i++)
-                buffer[buf_i++] = tmp[i];
-            break;
-        }
-        case '%':
-            putchar('%');
-            if (buf_i < (int)sizeof(buffer) - 1)
-                buffer[buf_i++] = '%';
-            break;
-        default:
-            putchar('%');
-            putchar(*p);
-            if (buf_i < (int)sizeof(buffer) - 2) {
-                buffer[buf_i++] = '%';
-                buffer[buf_i++] = *p;
-            }
-            break;
-        }
-    }
-
-    buffer[buf_i] = '\0';
-    va_end(args);
-
-    // 로그 기록
-    bootlog_add(buffer);
 }
 
 void vga_putc(int x, int y, char ch, uint8_t attr) {
@@ -1417,4 +1090,14 @@ int get_cursor_row(void) {
 
 int get_cursor_col(void) {
     return get_offset_col(get_cursor_offset());
+}
+
+int screen_write(const char* buf, size_t len)
+{
+    if (!buf) return 0;
+
+    for (size_t i = 0; i < len; i++)
+        print_char(buf[i], -1, -1, 0);
+
+    return (int)len;
 }

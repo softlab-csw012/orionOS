@@ -5,11 +5,15 @@
 #include "../mm/mem.h"
 #include "../libc/string.h"
 #include "../fs/disk.h"
-#include "../drivers/screen.h"
+#include "../kernel/io/console.h"
 #include "ramdisk.h"
 #include "usb/usb.h"
 #include <stdbool.h>
 #include <stdint.h>
+
+// NOTE:
+// Filesystem code should use drivers/blockdev.{h,c} and not call backend-specific
+// transports directly. blockdev forwards I/O to these ata_* entry points.
 
 /* ====== 채널/장치 매핑 ======
    drive 번호: 0=Pri Master (1F0/3F6)

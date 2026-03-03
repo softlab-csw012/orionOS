@@ -3,25 +3,23 @@
 #include "string.h"
 #include <stdint.h>
 
-char buf[128];
-
 int main(void) {
-    const char* msg = "Hello, World!\n";
-    size_t len = strlen(msg);
+    int in = 0;
+    int out = 1;
+    int err = 2;
 
-    int fd_con = sys_open("console");
-    sys_write(fd_con, msg, len);
+    char buf[128];
+    for (;;) {
+        int n = sys_read(in, buf, sizeof(buf));
+        if(n <= 0) {
+            sys_write(err, "read failed\r\n", 13);
+            continue;
+        }
+        sys_write(out, buf, (uint32_t)n);
+    }
+}
 
-    int fd1 = sys_open("/home/file1.txt");
-    sys_write(fd1, msg, len);
-
-    int a = sys_read(fd1, buf, sizeof(buf) - 1);
-    if (a  >  0) {
-        sys_write(fd_con, buf, a);
-    } 
-
-    sys_close(fd_con);
-    sys_close(fd1);
-
-    sys_exit(0);
+void _start(void) {
+    int rc = main();
+    sys_exit((uint32_t)rc);
 }
